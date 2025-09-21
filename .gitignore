@@ -1,0 +1,21 @@
+# Python / venv
+venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/*.log
+
+# キャッシュ / ノートブック
+.ipynb_checkpoints/
+.cache/
+
+# 大きなデータ（例）
+data/*.zip
+data/raw/*
+

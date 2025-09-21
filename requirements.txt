@@ -1,0 +1,16 @@
+streamlit
+python-dotenv
+numpy
+sentence-transformers
+openai>=1.40.0
+tiktoken
+
+# pdf text extraction
+pdfplumber
+
+# ocr (optional)
+pdf2image
+pytesseract
+pillow
+
+python-docx
