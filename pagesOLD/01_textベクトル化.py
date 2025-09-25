@@ -3,7 +3,7 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 
-from rag_utils import load_txt_files, split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
+from lib.rag_utils import load_txt_files, split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
 
 # ====== 初期化 ======
 load_dotenv()

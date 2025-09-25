@@ -16,7 +16,7 @@ from typing import List, Tuple, Dict
 import streamlit as st
 from dotenv import load_dotenv
 
-from rag_utils import split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
+from lib.rag_utils import split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
 
 # ====== 初期化 ======
 load_dotenv()

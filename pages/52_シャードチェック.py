@@ -1,10 +1,11 @@
+# pages/52_シャード健全性チェック.py
 # ------------------------------------------------------------
 # 🧩 シャード健全性チェック（容量・件数・整合性）
 # - data/vectorstore/<backend>/<shard_id>/ を走査
-# - vectors.npy の (行数n, 次元d), ファイルサイズ, meta.jsonl件数 を取得
-# - しきい値に基づき OK / WARN / NG を判定（コメント理由つき）
+# - vectors.npy の (行数n, 次元d), ファイルサイズ, meta.jsonl行数 を取得
+# - しきい値で OK / WARN / NG を判定（理由つき）
 # - RAM目安から「推奨最大ベクトル数/シャード」を自動試算（可編集）
-# - クリックで読める「RAM見積とは？」ヘルプ（popover/expander自動切替）
+# - 合計サイズは B/KB/MB/GB で人間向け表示（少量でも 0.00GB にならない）
 # ------------------------------------------------------------
 from __future__ import annotations
 from pathlib import Path
@@ -17,7 +18,7 @@ import streamlit as st
 # ========== ページ設定 ==========
 st.set_page_config(page_title="Shard Health Check", page_icon="🧩", layout="wide")
 
-# ========== パス規約（既存ボットと同一想定） ==========
+# ========== パス規約（既存アプリと同一想定） ==========
 APP_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = APP_ROOT / "data"
 VS_ROOT  = DATA_DIR / "vectorstore"   # data/vectorstore/<backend>/<shard_id>/
@@ -40,18 +41,19 @@ def list_shard_dirs(backend: str) -> List[Path]:
     return sorted([p for p in base.iterdir() if p.is_dir()])
 
 def sizeof_fmt(num: float) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+    """人間向けのサイズ表記（B/KB/MB/GB/TB）"""
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
         if abs(num) < 1024.0:
-            return f"{num:3.1f}{unit}"
+            return f"{num:,.2f} {unit}"
         num /= 1024.0
-    return f"{num:.1f}PB"
+    return f"{num:,.2f} EB"
 
 def load_vector_shape(vec_path: Path) -> Tuple[int, int]:
-    # メモリに載せない（mmap）で shape だけ取得
+    """mmapで shape だけ取得（RAMに載せない）"""
     arr = np.load(vec_path, mmap_mode="r")
     shape = tuple(arr.shape)
     if len(shape) == 1:
-        # 1次元は異常（想定は (n, d)）
+        # 想定外（(n,)）の場合は (n, 1) 扱い
         return (shape[0], 1)
     return (shape[0], shape[1])
 
@@ -81,7 +83,7 @@ def judge_status(row: Dict[str, Any],
     size_gb = float(row["vectors_npy_gb"])
     meta = int(row["meta_rows"])
     mismatch = abs(n - meta)
-    mismatch_pct = (mismatch / max(1, n)) * 100.0
+    mismatch_pct = (mismatch / max(1, n)) * 100.0 if n > 0 else 0.0
     est_ram_gb = float(row["est_ram_gb"])
 
     # チェック1: 件数しきい値
@@ -182,7 +184,7 @@ with st.sidebar:
     st.markdown("### シャードしきい値")
     max_vectors_file_gb = st.number_input(
         "vectors.npy 1ファイルの推奨上限 (GB)", min_value=0.1, max_value=64.0, value=2.0, step=0.1,
-        help="ファイルシステムや配布、転送の都合から大きすぎる単一ファイルは避けたい、という運用目安。",
+        help="大きすぎる単一ファイルは配布・転送・バックアップで不利、という運用目安。",
     )
     max_vectors_per_shard = st.number_input(
         "ベクトル数/シャードの推奨上限 (件)", min_value=10_000, max_value=5_000_000, value=300_000, step=10_000,
@@ -190,13 +192,13 @@ with st.sidebar:
     )
     mismatch_tol_pct = st.slider(
         "meta不整合の許容率(%)", 0.0, 20.0, 2.0, 0.5,
-        help="vectors.npyのn（行数）とmeta.jsonlの行数のズレがこの割合を超えるとWARN/NG。",
+        help="vectors.npy の n（行数）と meta.jsonl の行数のズレがこの割合を超えるとWARN/NG。",
     )
 
     st.markdown("### 追加オプション")
     sample_rows = st.number_input(
         "確認サンプル抽出（行）", min_value=0, max_value=50, value=0, step=1,
-        help="0=抽出しない。meta.jsonlの冒頭を表示します。",
+        help="0=抽出しない。meta.jsonl の冒頭を表示します。",
     )
 
 st.caption(f"スキャン対象: **{VS_ROOT} / {backend}**")
@@ -215,8 +217,8 @@ if not shards:
 # ========== 収集 ==========
 rows: List[Dict[str, Any]] = []
 total_vectors = 0
-total_ram_est = 0.0
-total_size_gb = 0.0
+total_ram_est_gb = 0.0
+total_size_bytes = 0  # ← bytesで合計
 
 for shp in shards:
     vec = shp / "vectors.npy"
@@ -261,8 +263,8 @@ for shp in shards:
     rows.append(row)
 
     total_vectors += n
-    total_ram_est += est_ram_gb
-    total_size_gb += size_gb
+    total_ram_est_gb += est_ram_gb
+    total_size_bytes += size_bytes  # ← bytesで加算
 
 # ========== 表示 ==========
 st.subheader("📊 シャード一覧")
@@ -270,7 +272,7 @@ if not rows:
     st.info("vectors.npy を含むシャードが見つかりませんでした。")
     st.stop()
 
-# 並び替え（危険度高→低）
+# 危険度高→低で並べ替え
 priority = {"NG": 0, "WARN": 1, "OK": 2}
 rows_sorted = sorted(rows, key=lambda r: (priority.get(r["status"], 3), -r["n_vectors"]))
 
@@ -304,7 +306,7 @@ for r in rows_sorted:
         "状態": status_icon(r["status"]),
         "ベクトル数 n": f'{r["n_vectors"]:,}',
         "次元 d": r["dim"],
-        "vectors.npy": sizeof_fmt(r["vectors_npy"]) + f" ({r['vectors_npy_gb']:.2f} GB)",
+        "vectors.npy": sizeof_fmt(float(r["vectors_npy"])) + f" ({r['vectors_npy_gb']:.2f} GB)",
         "meta.jsonl 行数": f'{r["meta_rows"]:,}',
         "不一致 (n - meta)": f'{r["mismatch"]:+,}',
         "RAM見積": f'{r["est_ram_gb"]:.2f} GB',
@@ -314,14 +316,20 @@ for r in rows_sorted:
 
 st.dataframe(table, use_container_width=True)
 
+# ===== 合計 / 概況（少量でも 0.00GB にならない表示） =====
 st.markdown("### 合計 / 概況")
 cols = st.columns(3)
 with cols[0]:
     st.metric("総ベクトル数", f"{total_vectors:,}")
 with cols[1]:
-    st.metric("vectors.npy 合計サイズ", f"{total_size_gb:.2f} GB")
+    # bytes → B/KB/MB/GB… に自動整形
+    st.metric("vectors.npy 合計サイズ", sizeof_fmt(float(total_size_bytes)))
 with cols[2]:
-    st.metric("RAM見積（全シャード）", f"{total_ram_est:.2f} GB")
+    # RAM合計は 1GB 未満なら MB で表示
+    st.metric(
+        "RAM見積（全シャード）",
+        f"{total_ram_est_gb*1024:.2f} MB" if total_ram_est_gb < 1.0 else f"{total_ram_est_gb:.2f} GB"
+    )
 
 # ========== 詳細（任意） ==========
 with st.expander("🧪 meta.jsonl の先頭サンプルを確認（任意）", expanded=False):
@@ -353,7 +361,6 @@ else:
         k, plan = plan_split(n, int(max_vectors_per_shard))
         st.markdown(f"**{r['shard_id']}** は **{n:,} 件** → 推奨分割数 **{k}**")
         st.caption("割当（概算）: " + ", ".join([f"shard_{i}: {cnt:,}" for (cnt, i) in plan]))
-
         with st.expander(f"分割の運用ヒント: {r['shard_id']}", expanded=False):
             st.markdown(
                 "- 元データの意味のある境界（年別・ファイル群など）で再ベクトル化すると運用が安定します。\n"

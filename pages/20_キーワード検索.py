@@ -1,35 +1,18 @@
-# ============================================
-# 変更点（この版での修正・追加）
-# --------------------------------------------
-# 1) 生成オプションを追加（OpenAI）:
-#    - サイドバーに「🧠 生成オプション」を追加し、次を設定可能に。
-#      ・ヒット要約を生成（有効/無効）
-#      ・使用モデル、temperature、max_tokens
-#      ・System Prompt、User Prompt テンプレート（{query}, {snippets} を埋め込み）
-#      ・生成に使うスニペット件数（Top-N）
-# 2) プロンプト微調整可能:
-#    - User Prompt（例: 「以下のヒットスニペットを基に『{query}』について要点をまとめて」）を UI から編集可能。
-# 3) 実行部に生成フェーズを追加:
-#    - 検索結果 DataFrame 作成後、選択された上位 N スニペットを結合して OpenAI に投入。
-#    - 生成結果を画面出力（"🧠 生成要約" セクション）。
-# 4) 安全性向上:
-#    - OPENAI_API_KEY 未設定時は生成オプションを自動的に無効化し警告。
-#    - スニペット中の HTML（<mark> 等）を除去してから LLM に渡す。
-# ============================================
-
-# pages/04_キーワード検索.py
+# pages/20_キーワード検索.py
 # ------------------------------------------------------------
-# 🔎 キーワード / 正規表現で meta.jsonl（テキスト）を横断検索
-# - data/vectorstore/<backend>/<shard_id>/meta.jsonl を読み込み
-# - AND/OR, 大文字小文字, 正規表現, 日本語スペース正規化(NFKC + CJK間スペース除去)
-# - シャード/年/ファイル絞り込み、結果ハイライト表示、CSV出力、year/file.pdf の📋コピー
-# - （オプション）ヒットスニペットを OpenAI に投げて要約を生成（プロンプト微調整可）
+# 🔎 meta.jsonl 横断検索 + （任意）OpenAI 生成要約
+# - gpt-5 系（特に gpt-5-mini）向けに事前トークン見積 & 自動バッチ要約を実装
+# - 生成前に「要約を実行」チェック + ボタンで明示確認（常に）
+# - オーバー時は警告表示、処理内容を逐一UIに明示
+# - gpt-5 系は Responses API（max_output_tokens）、他は Chat Completions
+# - temperature: gpt-5 系は 1.0 固定（UIは metric 表示）
+# - スニペットは既定で畳み表示（st.expander）
 # ------------------------------------------------------------
 
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Iterable, Any, Tuple
-from datetime import datetime  # noqa
+from datetime import datetime
 import re
 import json
 import unicodedata
@@ -46,10 +29,9 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = APP_ROOT / "data"
 VS_ROOT  = DATA_DIR / "vectorstore"
 
-# ============== 日本語正規化（クエリ/本文の揺れ対策） ==============
+# ============== 日本語正規化 ==============
 CJK = r"\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u4E00-\u9FFF\u3400-\u4DBF"
 PUNC = r"、。・，．！？：；（）［］｛｝「」『』〈〉《》【】"
-
 _cjk_cjk_space = re.compile(fr"(?<=[{CJK}])\s+(?=[{CJK}])")
 _space_before_punc = re.compile(fr"\s+(?=[{PUNC}])")
 _space_after_open = re.compile(fr"(?<=[（［｛「『〈《【])\s+")
@@ -67,21 +49,38 @@ def normalize_ja_text(s: str) -> str:
 
 # ============== ユーティリティ（生成用） ==============
 def strip_html(s: str) -> str:
-    """簡易に HTML タグを除去（<mark> 等）"""
     return re.sub(r"<[^>]+>", "", s or "")
 
-def _count_tokens(text: str, model_hint: str = "gpt-4o-mini") -> int:
+# ---- token helpers ----
+def _encoding_for(model_hint: str):
+    import tiktoken
     try:
-        import tiktoken
-        try:
-            enc = tiktoken.encoding_for_model(model_hint)
-        except Exception:
-            enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        return tiktoken.encoding_for_model(model_hint)
     except Exception:
-        return max(1, int(len(text) / 4))
+        return tiktoken.get_encoding("cl100k_base")
 
-# ============== JSONL 読み込み ==============
+def _count_tokens(text: str, model_hint: str = "gpt-5-mini") -> int:
+    try:
+        enc = _encoding_for(model_hint)
+        return len(enc.encode(text or ""))
+    except Exception:
+        return max(1, int(len(text or "") / 4))
+
+def _truncate_by_tokens(text: str, max_tokens: int, model_hint: str = "gpt-5-mini") -> str:
+    try:
+        enc = _encoding_for(model_hint)
+        toks = enc.encode(text or "")
+        if len(toks) <= max_tokens:
+            return text or ""
+        return enc.decode(toks[:max_tokens])
+    except Exception:
+        max_chars = max(100, max_tokens * 4)
+        return (text or "")[:max_chars]
+
+def _is_gpt5(model_name: str) -> bool:
+    return (model_name or "").lower().startswith("gpt-5")
+
+# ---- JSONL ----
 def iter_jsonl(path: Path) -> Iterable[Dict]:
     if not path.exists():
         return
@@ -93,12 +92,11 @@ def iter_jsonl(path: Path) -> Iterable[Dict]:
             try:
                 yield json.loads(s)
             except Exception:
-                # 壊れた行はスキップ
                 continue
 
 # ============== UI 基本 ==============
 load_dotenv()
-st.set_page_config(page_title="04 キーワード検索（meta横断）", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="20 キーワード検索（meta横断）", page_icon="🔎", layout="wide")
 st.title("🔎 キーワード検索（meta.jsonl 横断）")
 
 with st.sidebar:
@@ -117,7 +115,7 @@ with st.sidebar:
     st.subheader("絞り込み（任意）")
     year_min = st.number_input("年（下限）", value=0, step=1, help="0 で無効")
     year_max = st.number_input("年（上限）", value=9999, step=1, help="9999 で無効")
-    file_filter = st.text_input("ファイル名フィルタ（部分一致 / 例: budget）", value="").strip()
+    file_filter = st.text_input("ファイル名フィルタ（部分一致）", value="").strip()
 
     st.divider()
     st.subheader("表示設定")
@@ -129,16 +127,35 @@ with st.sidebar:
         default=["file","year","page","shard_id","score","text"]
     )
 
+    # ============== 生成オプション ==============
     st.divider()
     st.subheader("🧠 生成オプション（OpenAI）")
     has_key = bool(os.getenv("OPENAI_API_KEY"))
-    gen_enabled = st.checkbox("ヒット要約を生成する", value=False, disabled=not has_key)
+    gen_enabled = st.checkbox("ヒット要約を生成する", value=True if has_key else False, disabled=not has_key)
     if not has_key:
         st.warning("OPENAI_API_KEY が未設定のため、生成は無効です。", icon="⚠️")
-    model = st.selectbox("モデル", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0, disabled=not gen_enabled)
-    temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05, disabled=not gen_enabled)
-    max_tokens = st.slider("max_tokens", 128, 4000, 1000, 64, disabled=not gen_enabled)
+
+    model = st.selectbox(
+        "モデル",
+        ["gpt-5-mini", "gpt-5", "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
+        index=0,
+        disabled=not gen_enabled
+    )
+
+    # gpt-5 系は temperature=1 固定（Sliderはエラーになるので metric 表示）
+    if _is_gpt5(model):
+        temperature = 1.0
+        st.metric(label="temperature", value="1.0")
+        st.caption("🔒 gpt-5 系モデルでは temperature=1 に固定されます。")
+    else:
+        temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05, disabled=not gen_enabled)
+
+    # 上限は広めに（モデルが対応しない値は API が弾く）
+    max_tokens = st.slider("出力トークン上限", 128, 32000, 2000, 128, disabled=not gen_enabled)
     topn_snippets = st.slider("生成に使う上位スニペット数", 5, 200, 30, 5, disabled=not gen_enabled)
+
+    auto_batch = st.checkbox("オーバー時は自動バッチ要約で処理する（推奨）", value=True, disabled=not gen_enabled)
+    verbose_log = st.checkbox("バッチ処理の詳細ログを表示", value=True, disabled=not gen_enabled)
 
     sys_prompt = st.text_area(
         "System Prompt",
@@ -178,66 +195,46 @@ with c6:
 go = st.button("検索を実行", type="primary")
 
 # ============== 検索ロジック ==============
-def to_flags(case_sensitive: bool) -> int:
-    return 0 if case_sensitive else re.IGNORECASE
-
 def compile_terms(q: str, use_regex: bool, case_sensitive: bool) -> List[re.Pattern]:
     if normalize_query:
         q = normalize_ja_text(q)
     terms = [t for t in q.split() if t]
     if not terms:
         return []
-    flags = to_flags(case_sensitive)
+    flags = 0 if case_sensitive else re.IGNORECASE
     pats = []
     for t in terms:
         if use_regex:
             try:
                 pats.append(re.compile(t, flags))
             except re.error:
-                # 不正な正規表現はリテラル扱い
                 pats.append(re.compile(re.escape(t), flags))
         else:
             pats.append(re.compile(re.escape(t), flags))
     return pats
 
-def find_first_span(text: str, pats: List[re.Pattern]) -> Tuple[int,int,List[str]]:
-    """
-    最初に見つかったヒット位置（min start, max end）と、ヒットした語の一覧を返す
-    """
-    hits = []
-    s_min = None
-    e_max = None
+def make_snippet(text: str, pats: List[re.Pattern], total_len: int = 240) -> str:
+    s_pos, e_pos = 0, 0
     for p in pats:
         m = p.search(text)
         if m:
-            hits.append(p.pattern)
-            s, e = m.start(), m.end()
-            s_min = s if s_min is None else min(s_min, s)
-            e_max = e if e_max is None else max(e_max, e)
-    if s_min is None:
-        return -1, -1, []
-    return s_min, e_max, hits
-
-def make_snippet(text: str, pats: List[re.Pattern], total_len: int = 240) -> str:
-    s, e, _ = find_first_span(text, pats)
-    if s < 0:
-        s, e = 0, min(len(text), total_len)
-    margin = max(0, total_len // 2)
-    left = max(0, s - margin)
-    right = min(len(text), e + margin)
+            s_pos, e_pos = m.start(), m.end()
+            break
+    if e_pos == 0:
+        s_pos, e_pos = 0, min(len(text), total_len)
+    margin = total_len // 2
+    left = max(0, s_pos - margin)
+    right = min(len(text), e_pos + margin)
     snippet = text[left:right]
-
-    # ハイライト（HTML）
     for p in pats:
         try:
             snippet = p.sub(lambda m: f"<mark>{m.group(0)}</mark>", snippet)
         except re.error:
             pass
-    # 端に省略記号
     if left > 0:
-        snippet = "…"+snippet
+        snippet = "…" + snippet
     if right < len(text):
-        snippet = snippet+"…"
+        snippet = snippet + "…"
     return snippet
 
 def copy_button(text: str, label: str, key: str):
@@ -256,7 +253,6 @@ def copy_button(text: str, label: str, key: str):
             btn.innerText = "✅ コピーしました";
             setTimeout(()=>{{ btn.innerText = old; }}, 1200);
           }} catch(e) {{
-            console.error(e);
             alert("コピーに失敗しました: " + e);
           }}
         }});
@@ -265,6 +261,107 @@ def copy_button(text: str, label: str, key: str):
     """
     st.components.v1.html(html, height=38)
 
+# ---------- OpenAI 呼び出し ----------
+def _use_mct(model_name: str) -> bool:
+    m = (model_name or "").lower()
+    return m.startswith("gpt-5") or m.startswith("o")
+
+def _chat_complete_safely(client: OpenAI, *, model: str, temperature: float,
+                          limit_tokens: int, system_prompt: str, user_prompt: str):
+    def _call(use_mct: bool):
+        payload = {
+            "model": model,
+            "temperature": float(temperature),
+            "messages": [
+                {"role": "system", "content": system_prompt.strip()},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if use_mct:
+            payload["max_completion_tokens"] = int(limit_tokens)
+        else:
+            payload["max_tokens"] = int(limit_tokens)
+        return client.chat.completions.create(**payload)
+    prefer_mct = _use_mct(model)
+    try:
+        return _call(prefer_mct)
+    except Exception:
+        return _call(not prefer_mct)
+
+def _extract_text_from_chat(resp_obj) -> str:
+    try:
+        content = resp_obj.choices[0].message.content
+        return content or ""
+    except Exception:
+        return ""
+
+# Responses API for gpt-5（SDK差異のため response_format は渡さない）
+def _responses_generate(client: OpenAI, *, model: str, temperature: float,
+                        max_output_tokens: int, system_prompt: str, user_prompt: str):
+    return client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user",   "content": user_prompt},
+        ],
+        temperature=float(temperature),
+        max_output_tokens=int(max_output_tokens),
+    )
+
+def _responses_text(resp) -> str:
+    try:
+        txt = resp.output_text
+        if isinstance(txt, str) and txt.strip():
+            return txt
+    except Exception:
+        pass
+    try:
+        out = getattr(resp, "output", None)
+        if out:
+            for item in out:
+                if getattr(item, "type", "") == "message":
+                    for c in getattr(item, "content", []) or []:
+                        t = getattr(c, "text", None)
+                        if isinstance(t, str) and t.strip():
+                            return t
+                t = getattr(item, "text", None)
+                if isinstance(t, str) and t.strip():
+                    return t
+    except Exception:
+        pass
+    return ""
+
+# ============== バッチ分割ロジック（gpt-5-mini前提） ==============
+def _gpt5mini_limits():
+    # 既定：context 128k、セーフティマージン 2k
+    return 128_000, 2_000
+
+def _estimate_prompt_tokens(model: str, sys_prompt: str, user_prompt_prefix: str) -> int:
+    return _count_tokens(sys_prompt, model) + _count_tokens(user_prompt_prefix, model)
+
+def _split_into_batches(snippets: List[str], model: str, input_budget_tokens: int) -> List[List[str]]:
+    batches: List[List[str]] = []
+    current: List[str] = []
+    cur_tokens = 0
+    for s in snippets:
+        t = _count_tokens(s, model)
+        if t > input_budget_tokens:
+            s = _truncate_by_tokens(s, input_budget_tokens, model)
+            t = _count_tokens(s, model)
+        if cur_tokens + t <= input_budget_tokens:
+            current.append(s); cur_tokens += t
+        else:
+            if current:
+                batches.append(current)
+            current = [s]; cur_tokens = t
+    if current:
+        batches.append(current)
+    return batches
+
+def _render_snippets(snips: List[str]) -> str:
+    return "\n\n".join(snips)
+
+# ============== 実行 ==============
 if go:
     if not sel_shards:
         st.warning("少なくとも1つのシャードを選択してください。")
@@ -282,35 +379,22 @@ if go:
         meta_path = base_dir / sid / "meta.jsonl"
         for obj in iter_jsonl(meta_path):
             total_scanned += 1
-            # 年・ファイルフィルタ
             yr = obj.get("year", None)
             if isinstance(yr, int):
                 if year_min and yr < year_min: continue
                 if year_max and year_max < 9999 and yr > year_max: continue
-            if file_filter:
-                if file_filter.lower() not in str(obj.get("file","")).lower():
-                    continue
+            if file_filter and file_filter.lower() not in str(obj.get("file","")).lower():
+                continue
 
             text = str(obj.get("text",""))
-            if norm_body:
-                text_for_match = normalize_ja_text(text)
-            else:
-                text_for_match = text
+            text_for_match = normalize_ja_text(text) if norm_body else text
 
-            # マッチ判定
-            if bool_mode == "AND":
-                ok = all(p.search(text_for_match) for p in pats)
-            else:
-                ok = any(p.search(text_for_match) for p in pats)
-
+            ok = all(p.search(text_for_match) for p in pats) if bool_mode == "AND" \
+                 else any(p.search(text_for_match) for p in pats)
             if not ok:
                 continue
 
-            # スコア = マッチ語の合計出現数（簡易）
-            score = 0
-            for p in pats:
-                score += len(list(p.finditer(text_for_match)))
-
+            score = sum(len(list(p.finditer(text_for_match))) for p in pats)
             rows.append({
                 "file": obj.get("file"),
                 "year": obj.get("year"),
@@ -331,73 +415,237 @@ if go:
         st.warning("ヒットなし。検索語やフィルタを調整してください。")
         st.stop()
 
-    # スコア降順で並べ替え
     df = pd.DataFrame(rows).sort_values(["score","year","file","page"], ascending=[False, True, True, True])
 
     st.success(f"ヒット {len(df):,d} 件 / 走査 {total_scanned:,d} レコード（上位のみ表示）")
-    # HTMLハイライトを効かせるため text 列は markdown 表示に
+
     show_order = [c for c in show_cols if c in df.columns]
-    if "text" in show_order:
-        non_text_cols = [c for c in show_order if c != "text"]
-    else:
-        non_text_cols = show_order
-
+    non_text_cols = [c for c in show_order if c != "text"]
     st.dataframe(df[non_text_cols], use_container_width=True, height=420)
-    if "text" in show_order:
-        st.markdown("#### ヒットスニペット")
-        for i, row in df.head(200).iterrows():  # スニペット部分は別レンダリング
-            colA, colB = st.columns([4,1])
-            with colA:
-                st.markdown(f"**{row.get('file')}**  year={row.get('year')}  p.{row.get('page')}  "
-                            f"score={row.get('score')}", help=row.get("chunk_id"))
-                st.markdown(row.get("text",""), unsafe_allow_html=True)
-            with colB:
-                copy_button(text=str(row.get("file")), label="year/file をコピー", key=f"cpy_{i}")
 
-    # ダウンロード（CSV）
     csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("📥 CSV をダウンロード", data=csv_bytes, file_name="keyword_hits.csv", mime="text/csv")
 
-    # ============== 生成フェーズ（オプション） ==============
+    # ============== 生成（スニペットより前に表示） ==============
     if gen_enabled:
-        try:
-            st.divider()
-            st.subheader("🧠 生成要約（OpenAI）")
+        st.divider()
+        st.subheader("🧠 生成要約（OpenAI）")
 
-            # 上位 N 件のスニペットを結合（HTML除去）
-            take_n = int(topn_snippets)
-            selected = df.head(take_n).copy()
-            # スニペット本文（text列はHTMLハイライトなので除去）
-            joined_snippets = []
-            for _, r in selected.iterrows():
-                src = f"{r.get('file')} p.{r.get('page')} (score={r.get('score')})"
-                snip = strip_html(str(r.get("text","")))
-                joined_snippets.append(f"---\n# Source: {src}\n{snip}")
-            snippets_text = "\n\n".join(joined_snippets)
+        # 1) 上位 N スニペット（HTML除去 & 1つひとつに Source ラベル）
+        take_n = int(topn_snippets)
+        selected = df.head(take_n).copy()
 
-            # プロンプト生成
-            user_prompt = user_prompt_tpl.format(query=query, snippets=snippets_text)
+        labelled_snips: List[str] = []
+        for _, r in selected.iterrows():
+            src = f"{r.get('file')} p.{r.get('page')} (score={r.get('score')})"
+            snip = strip_html(str(r.get("text","")))
+            labelled_snips.append(f"---\n# Source: {src}\n{snip}")
 
-            # ざっくりトークン数（目安）
-            approx_tokens = _count_tokens(user_prompt, model_hint=model)
-            st.caption(f"（プロンプト推定トークン: ~{approx_tokens:,} tok）")
+        # 2) 事前見積（まずは表示だけ行う）
+        model_hint = model
+        context_limit, safety_margin = _gpt5mini_limits() if _is_gpt5(model) else (128_000, 1_000)
+        user_prefix = user_prompt_tpl.replace("{snippets}", "").format(query=query, snippets="")
+        prompt_overhead = _estimate_prompt_tokens(model_hint, sys_prompt, user_prefix)
+        snippets_tokens = sum(_count_tokens(s, model_hint) for s in labelled_snips)
+        want_output = int(max_tokens)
+        needed_total = prompt_overhead + snippets_tokens + want_output + safety_margin
 
+        st.caption(f"見積: prompt+snips={prompt_overhead + snippets_tokens:,} / "
+                   f"出力上限={want_output:,} / safety={safety_margin:,} / "
+                   f"context_limit~{context_limit:,}")
+
+        will_overflow = needed_total > context_limit
+        if will_overflow:
+            over = needed_total - context_limit
+            st.error(f"⚠️ 入力が大きすぎます（推定 {needed_total:,} tok が上限 {context_limit:,} tok を {over:,} tok 超過）。", icon="⚠️")
+            if not auto_batch:
+                st.info("対処: ① 生成に使うスニペット数を減らす ② 出力トークン上限を下げる ③ モデルを変更（大コンテキスト）")
+
+        # 3) 実行前確認 UI（常に確認）
+        with st.form("run_summary_form"):
+            agree = st.checkbox("この条件で要約を実行してよい（実行前の最終確認）", value=False)
+            run_summary = st.form_submit_button("🧠 要約を実行", type="primary", use_container_width=True)
+        if not (agree and run_summary):
+            st.info("要約を開始するには、チェックを入れて『🧠 要約を実行』を押してください。")
+        else:
+            # ==== ここから実際の生成 ====
             client = OpenAI()
-            with st.spinner("OpenAI で要約を生成中…"):
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=float(temperature),
-                    max_tokens=int(max_tokens),
-                    messages=[
-                        {"role": "system", "content": sys_prompt.strip()},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-            out_text = resp.choices[0].message.content
-            st.markdown(out_text)
 
-        except Exception as e:
-            st.error(f"生成に失敗しました: {e}")
+            if will_overflow and not auto_batch:
+                st.stop()
+
+            # --- 自動バッチ要約 ---
+            if will_overflow and auto_batch:
+                st.info("🪄 自動バッチ要約を開始します：スニペットを複数バッチに分割 → 各バッチ要約 → 最終統合。")
+                per_batch_budget = max(1000, context_limit - want_output - safety_margin - prompt_overhead)
+                batches = _split_into_batches(labelled_snips, model_hint, per_batch_budget)
+                st.caption(f"バッチ数: {len(batches)} / バッチ入力バジェット~{per_batch_budget:,} tok")
+
+                batch_summaries: List[str] = []
+                for bi, batch in enumerate(batches, start=1):
+                    batch_snips = _render_snippets(batch)
+                    user_prompt = user_prompt_tpl.format(query=query, snippets=batch_snips)
+                    approx_in = _count_tokens(user_prompt, model_hint) + _count_tokens(sys_prompt, model_hint)
+                    if verbose_log:
+                        st.write(f"Batch {bi}/{len(batches)}: 入力推定 ~{approx_in:,} tok / 出力上限 {want_output:,} tok")
+                    with st.spinner(f"Batch {bi}/{len(batches)} を要約中…"):
+                        if _is_gpt5(model):
+                            resp = _responses_generate(
+                                client, model=model, temperature=float(temperature),
+                                max_output_tokens=want_output, system_prompt=sys_prompt,
+                                user_prompt=user_prompt
+                            )
+                            text = _responses_text(resp)
+                            finish = getattr(resp, "finish_reason", None)
+                            usage  = getattr(resp, "usage", None)
+                        else:
+                            resp = _chat_complete_safely(
+                                client, model=model, temperature=float(temperature),
+                                limit_tokens=want_output, system_prompt=sys_prompt,
+                                user_prompt=user_prompt
+                            )
+                            text = _extract_text_from_chat(resp)
+                            try:
+                                finish = resp.choices[0].finish_reason
+                                usage = resp.usage
+                            except Exception:
+                                finish, usage = None, None
+                    if verbose_log:
+                        try:
+                            ct = getattr(usage, "completion_tokens", None) or usage.get("completion_tokens")
+                            pt = getattr(usage, "prompt_tokens", None) or usage.get("prompt_tokens")
+                            st.caption(f"Batch {bi}: finish={finish} / tokens(c/p)={ct}/{pt}")
+                        except Exception:
+                            st.caption(f"Batch {bi}: finish={finish}")
+                    batch_summaries.append(f"[Batch {bi} 要約]\n{text.strip()}")
+
+                # 最終統合
+                st.info("🧩 バッチ要約を統合しています…")
+                joined_batch = "\n\n".join(batch_summaries)
+                prefix = "以下は複数バッチの要約です。重複を統合し、矛盾を解消し、最終の簡潔な日本語サマリを出力してください。\n\n"
+                integration_prompt = f"{prefix}{joined_batch}"
+                approx_integration = _count_tokens(integration_prompt, model_hint) + _count_tokens(sys_prompt, model_hint)
+                if approx_integration + want_output + safety_margin > context_limit:
+                    keep = context_limit - want_output - safety_margin - _count_tokens(sys_prompt, model_hint)
+                    integration_prompt = _truncate_by_tokens(integration_prompt, max(1000, keep), model_hint)
+                    approx_integration = _count_tokens(integration_prompt, model_hint) + _count_tokens(sys_prompt, model_hint)
+                    st.caption(f"統合プロンプトをトリム: 入力推定 ~{approx_integration:,} tok")
+
+                with st.spinner("最終統合要約を生成中…"):
+                    if _is_gpt5(model):
+                        final_resp = _responses_generate(
+                            client, model=model, temperature=float(temperature),
+                            max_output_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=integration_prompt
+                        )
+                        final_text = _responses_text(final_resp)
+                        finish_final = getattr(final_resp, "finish_reason", None)
+                        usage_final  = getattr(final_resp, "usage", None)
+                    else:
+                        final_resp = _chat_complete_safely(
+                            client, model=model, temperature=float(temperature),
+                            limit_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=integration_prompt
+                        )
+                        final_text = _extract_text_from_chat(final_resp)
+                        try:
+                            finish_final = final_resp.choices[0].finish_reason
+                            usage_final  = final_resp.usage
+                        except Exception:
+                            finish_final, usage_final = None, None
+
+                st.markdown(final_text if final_text.strip() else "_（統合結果が空でした）_")
+                cols = st.columns(3)
+                with cols[0]:
+                    st.caption(f"finish_reason: **{finish_final}**")
+                with cols[1]:
+                    try:
+                        ct = getattr(usage_final, "completion_tokens", None) or usage_final.get("completion_tokens")
+                        pt = getattr(usage_final, "prompt_tokens", None) or usage_final.get("prompt_tokens")
+                        st.caption(f"tokens (c/p): **{ct}/{pt}**")
+                    except Exception:
+                        pass
+                with cols[2]:
+                    st.caption(f"model: **{model}**")
+
+            else:
+                # --- 単発で収まる場合 ---
+                snippets_text = _render_snippets(labelled_snips)
+                user_prompt = user_prompt_tpl.format(query=query, snippets=snippets_text)
+                approx_total = _count_tokens(user_prompt, model_hint) + _count_tokens(sys_prompt, model_hint)
+                st.caption(f"（プロンプト推定トークン: ~{approx_total:,} tok / 出力上限 {want_output:,} tok）")
+
+                with st.spinner("要約を生成中…"):
+                    if _is_gpt5(model):
+                        raw = _responses_generate(
+                            client, model=model, temperature=float(temperature),
+                            max_output_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=user_prompt
+                        )
+                        out_text = _responses_text(raw)
+                        finish = getattr(raw, "finish_reason", None)
+                        usage  = getattr(raw, "usage", None)
+                    else:
+                        raw = _chat_complete_safely(
+                            client, model=model, temperature=float(temperature),
+                            limit_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=user_prompt
+                        )
+                        out_text = _extract_text_from_chat(raw)
+                        try:
+                            finish = raw.choices[0].finish_reason
+                            usage  = raw.usage
+                        except Exception:
+                            finish, usage = None, None
+
+                if (not out_text or not out_text.strip()) and finish == "length":
+                    st.info("🔁 出力が打ち切られたため、続きの生成を加えています…")
+                    cont_prompt = user_prompt + "\n\n【続きのみを簡潔に出力してください。】"
+                    if _is_gpt5(model):
+                        raw2 = _responses_generate(
+                            client, model=model, temperature=float(temperature),
+                            max_output_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=cont_prompt
+                        )
+                        out_text2 = _responses_text(raw2)
+                    else:
+                        raw2 = _chat_complete_safely(
+                            client, model=model, temperature=float(temperature),
+                            limit_tokens=want_output, system_prompt=sys_prompt,
+                            user_prompt=cont_prompt
+                        )
+                        out_text2 = _extract_text_from_chat(raw2)
+                    out_text = (out_text or "") + ("\n" + out_text2 if out_text2 else "")
+
+                st.markdown(out_text if (out_text and out_text.strip()) else "_（本文が返りませんでした）_")
+                cols = st.columns(3)
+                with cols[0]:
+                    st.caption(f"finish_reason: **{finish}**")
+                with cols[1]:
+                    try:
+                        ct = getattr(usage, "completion_tokens", None) or usage.get("completion_tokens")
+                        pt = getattr(usage, "prompt_tokens", None) or usage.get("prompt_tokens")
+                        st.caption(f"tokens (c/p): **{ct}/{pt}**")
+                    except Exception:
+                        pass
+                with cols[2]:
+                    st.caption(f"model: **{model}**")
+
+    # ============== ヒットスニペット（既定で畳む） ==============
+    if "text" in show_order:
+        st.divider()
+        with st.expander("ヒットスニペット（クリックで展開）", expanded=False):
+            for i, row in df.head(200).iterrows():
+                colA, colB = st.columns([4,1])
+                with colA:
+                    st.markdown(
+                        f"**{row.get('file')}**  year={row.get('year')}  p.{row.get('page')}  "
+                        f"score={row.get('score')}",
+                        help=row.get("chunk_id")
+                    )
+                    st.markdown(row.get("text",""), unsafe_allow_html=True)
+                with colB:
+                    copy_button(text=str(row.get("file")), label="year/file をコピー", key=f"cpy_{i}")
 
 else:
     st.info("左でシャードと条件を選び、キーワードを入力して『検索を実行』してください。")
