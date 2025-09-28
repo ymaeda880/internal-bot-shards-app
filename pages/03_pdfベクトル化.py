@@ -26,30 +26,13 @@ from config import pricing
 from lib.rag_utils import split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
 from lib.vectorstore_utils import load_processed_files, save_processed_files  # 既存ユーティリティを活用
 
+from lib.text_normalize import normalize_ja_text
+
 # ============================================================
 # 定数
 # ============================================================
 OPENAI_EMBED_MODEL = "text-embedding-3-large"  # ← 大固定（3072 次元）
 
-# ============================================================
-# 日本語正規化（japanese normalization）
-# ============================================================
-CJK = r"\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u4E00-\u9FFF\u3400-\u4DBF"
-PUNC = r"、。・，．！？：；（）［］｛｝「」『』〈〉《》【】"
-_cjk_cjk_space = re.compile(fr"(?<=[{CJK}])\s+(?=[{CJK}])")
-_space_before_punc = re.compile(fr"\s+(?=[{PUNC}])")
-_space_after_open = re.compile(fr"(?<=[（［｛「『〈《【])\s+")
-_space_before_close = re.compile(fr"\s+(?=[）］｝」』〉》】])")
-_multi_space = re.compile(r"[ \t\u3000]+")
-
-def normalize_ja_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = _cjk_cjk_space.sub("", s)
-    s = _space_before_punc.sub("", s)
-    s = _space_after_open.sub("", s)
-    s = _space_before_close.sub("", s)
-    s = _multi_space.sub(" ", s)
-    return s.strip()
 
 # ============================================================
 # tokenizer（large に合わせる）

@@ -1,30 +1,18 @@
-# pages/10_ボット（新）.py
+# pages/10_ボット（改良版）.py
 
 # ============================================
 # 変更点（この版での修正・追加）
 # --------------------------------------------
-# 1) OpenAIキー未設定時の安全化:
-#    - 埋め込み backend=openai かつ OPENAI_API_KEY 未設定なら自動で 'local' に切替。
-# 2) vdb.search() のスコア向きを明示:
-#    - return_="similarity" を常に指定（「大きいほど良い」前提でヒープ/ソート）。
-# 3) 参照ファイルホワイトリストの安全比較:
-#    - NFKC/大小文字/区切り(\\ → /) 正規化して一致判定（_norm_path）。
-# 4) インライン [[files: ...]] 抽出/除去の堅牢化:
-#    - 余白許容・大文字小文字無視の正規表現に強化。
-# 5) send_now 判定の安全化:
-#    - go = go_click or bool(locals().get("send_now"))
-# 6) コメントで「score は similarity」を明示し将来の混在を抑止。
+# 1) モデル選択の統一（pricing の一覧を使用、既定 gpt-5-mini）
+# 2) Responses系（gpt-5*, gpt-4.1*）に自動対応（role分離、max_output_tokens、温度無効 等）
+# 3) 料金計算は lib/costs.py に集約（このページは呼ぶだけ）
+# 4) 同点スコア時のヒープ比較バグ回避（タイブレーク）
+# 5) OpenAIキー: secrets.toml → env を継続
+# 6) 既存機能維持（[[files: ...]]、シャード選択、RAG検索、Retrieve-only）
+# 7) サンプル質問UI維持
+# 8) 回答品質改善: build_prompt(strict=False)
+# 9) 為替入力はサイドバーから削除。常に DEFAULT_USDJPY を使用。
 # ============================================
-
-# ------------------------------------------------------------
-# 💬 Internal Bot (RAG, No-FAISS) — 以前のボット風UI + シャード横断検索版（参照ファイル指定対応）
-# - data/vectorstore/<backend>/<shard_id>/ を横断して top-k マージ
-# - 日本語の「1文字ごと空白」問題に対応（normalize_ja_text）
-# - OpenAI キー未設定時は自動で Retrieve-only に切替
-# - vdb.search の戻り値が (row_idx, score, meta) / (score, meta) どちらでも受ける
-# - 参照ファイルをサイドバー／質問内 [[files: 2025/a.pdf, 2024/b.pdf]] で指定可能
-# - 同点スコア時のヒープ比較で dict 比較が起きないようにタイブレークを導入
-# ------------------------------------------------------------
 
 from __future__ import annotations
 import os
@@ -32,7 +20,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 import random
 import heapq
-from itertools import count  # ★ 同点スコアのタイブレーク
+from itertools import count
 import unicodedata
 import re
 
@@ -41,29 +29,33 @@ import numpy as np
 from openai import OpenAI
 
 from lib.rag_utils import EmbeddingStore, NumpyVectorDB, build_prompt
-from config.path_config import PATHS  # ★ VS_ROOT を設定ファイルから取得
+from config.path_config import PATHS  # VS_ROOT を設定ファイルから取得
+from lib.text_normalize import normalize_ja_text
+
+from config.sample_questions import SAMPLES, ALL_SAMPLES  # ★追加
+
+
+
+# === 料金計算は lib/costs.py に一本化 ===
+from lib.costs import (
+    MODEL_PRICES_USD,           # USD / 1M tok
+    EMBEDDING_PRICES_USD,       # USD / 1M tok（/1K 表示時は /1000）
+    DEFAULT_USDJPY,
+    ChatUsage,
+    estimate_chat_cost,         # -> {"usd": x, "jpy": y}
+    estimate_embedding_cost,    # -> {"usd": x, "jpy": y}
+    usd_to_jpy,
+)
+
+# ========= /1M → /1K 変換（表示用） =========
+# ※ 単価表示・選択UIのため /1K を用意（計算自体は costs.py に任せる）
+MODEL_PRICES_PER_1K: Dict[str, Dict[str, float]] = {
+    m: {"in": float(p.get("in", 0.0)) / 1000.0, "out": float(p.get("out", 0.0)) / 1000.0}
+    for m, p in MODEL_PRICES_USD.items()
+}
 
 # ========= パス =========
 VS_ROOT: Path = PATHS.vs_root  # 例: <project>/data/vectorstore
-
-# ========= 日本語テキスト正規化 =========
-CJK = r"\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u4E00-\u9FFF\u3400-\u4DBF"
-PUNC = r"、。・，．！？：；（）［］｛｝「」『』〈〉《》【】"
-
-_cjk_cjk_space = re.compile(fr"(?<=[{CJK}])\s+(?=[{CJK}])")
-_space_before_punc = re.compile(fr"\s+(?=[{PUNC}])")
-_space_after_open = re.compile(fr"(?<=[（［｛「『〈《【])\s+")
-_space_before_close = re.compile(fr"\s+(?=[）］｝」』〉》】])")
-_multi_space = re.compile(r"[ \t\u3000]+")
-
-def normalize_ja_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = _cjk_cjk_space.sub("", s)
-    s = _space_before_punc.sub("", s)
-    s = _space_after_open.sub("", s)
-    s = _space_before_close.sub("", s)
-    s = _multi_space.sub(" ", s)
-    return s.strip()
 
 # ========= ユーティリティ =========
 def _count_tokens(text: str, model_hint: str = "cl100k_base") -> int:
@@ -84,14 +76,6 @@ def _fmt_source(meta: Dict[str, Any]) -> str:
     base = f"{f} p.{int(p)}" if (f and p is not None) else (f or "(unknown)")
     return f"{base} ({cid})" if cid else base
 
-def _format_contexts_for_prompt(hits: List[Tuple[int, float, Dict[str, Any]]]) -> List[str]:
-    labeled = []
-    for i, (idx, score, meta) in enumerate(hits, 1):
-        txt = str(meta.get("text", "") or "")
-        file_label = _fmt_source(meta)
-        labeled.append(f"[S{i}] {txt}\n[meta: {file_label} / score={float(score):.3f}]")
-    return labeled
-
 def _list_shard_dirs(backend: str) -> List[Path]:
     base = VS_ROOT / backend
     if not base.exists():
@@ -99,18 +83,12 @@ def _list_shard_dirs(backend: str) -> List[Path]:
     return sorted([p for p in base.iterdir() if p.is_dir()])
 
 def _norm_path(s: str) -> str:
-    """年/ファイル名の一致を安定させるための正規化"""
     s = unicodedata.normalize("NFKC", s or "")
     s = s.strip().replace("\\", "/")
     return s.lower()
 
 def _get_openai_api_key() -> str | None:
-    """
-    secrets.toml -> env の順で取得:
-      .streamlit/secrets.toml:
-        [openai]
-        api_key = "sk-..."
-    """
+    # secrets.toml -> env
     try:
         ok = st.secrets.get("openai", {}).get("api_key")
         if ok:
@@ -119,36 +97,17 @@ def _get_openai_api_key() -> str | None:
         pass
     return os.getenv("OPENAI_API_KEY")
 
-# =========================
-# サンプル質問
-# =========================
-SAMPLES = {
-    "補助金": [
-        "この資料の補助対象経費・対象外経費の要件を簡潔にまとめてください。[出典を明記]",
-        "この資料の補助対象者を簡潔にまとめてください。[出典を明記]",
-        "申請スケジュールと主要な締切日を一覧で教えてください。",
-        "中小企業者・小規模事業者の定義を比較表で示してください。",
-    ],
-    "環境ガイドライン": [
-        "ガイドライン改定の背景を整理してください。",
-        "環境報告の記載事項について教えてください。",
-    ],
-    "令和７年度環境省行政事業レビュー": [
-        "令和７年度環境省行政事業レビューの参加者は。",
-        "令和７年度環境省行政事業レビューにおいて放射線の健康管理について出た意見は？。",
-        "令和７年度環境省行政事業レビューにおいて潮流発電について出た意見は？"
-    ],
-     "政策委員会金融政策決定会合": [
-        "2023年10月30日の政策委員会金融政策決定会合の出席委員",
-        "2024年1月22日の政策委員会金融政策決定会合の政府からの出席者は",
-        "2024年1月23日の政策委員会金融政策決定会合の政府からの出席者を全て教えて（慎重に考えて2024年1月22 日ではなく2024年1月23日です）",
-        "2023年10月30日の政策委員会金融政策決定会合で議論された為替市場動向は"
-    ],
-}
-ALL_SAMPLES = [q for qs in SAMPLES.values() for q in qs]
+# ---------- モデル分類 ----------
+# Responses API 系（temperature 非対応、max_output_tokens を使う）
+RESPONSES_MODELS = [m for m in MODEL_PRICES_PER_1K.keys() if m.startswith("gpt-5") or m.startswith("gpt-4.1")]
+# Chat Completions API 系（temperature / max_tokens 使用可）
+CHAT_MODELS = [m for m in MODEL_PRICES_PER_1K.keys() if m.startswith("gpt-4o") or m.startswith("gpt-3.5")]
+
+def _use_responses_api(model_name: str) -> bool:
+    return model_name in RESPONSES_MODELS
 
 # =========================
-# Streamlit 準備（以前のボット風UI）
+# Streamlit UI
 # =========================
 st.set_page_config(page_title="Chat Bot (Sharded)", page_icon="💬", layout="wide")
 st.title("💬 Internal Bot (RAG, Shards)")
@@ -170,6 +129,12 @@ with st.sidebar:
     )
     embed_backend = "openai" if embed_backend_label.startswith("openai") else "local"
 
+    # 回答モデル選択
+    st.markdown("### 回答モデル")
+    all_models_sorted = sorted(MODEL_PRICES_PER_1K.keys(), key=lambda x: (0 if x.startswith("gpt-5") else 1, x))
+    default_idx = all_models_sorted.index("gpt-5-mini") if "gpt-5-mini" in all_models_sorted else 0
+    chat_model = st.selectbox("モデルを選択", all_models_sorted, index=default_idx)
+
     # 検索件数
     top_k = st.slider("検索件数（Top-K）", 1, 12, 6, 1)
 
@@ -179,10 +144,18 @@ with st.sidebar:
     detail = label_to_value[detail_label]
 
     cite = st.checkbox("出典を角括弧で引用（[S1] 等）", value=True)
-    max_tokens = st.slider("最大トークン数", 256, 4000, 1200, 64)
-    temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05)
 
-    answer_backend = st.radio("回答モデル", ["OpenAI", "Retrieve-only"], index=0)
+    # 温度（Responses系は無効化）
+    is_responses = _use_responses_api(chat_model)
+    temperature = st.slider(
+        "temperature（Chat系のみ有効）", 0.0, 1.0, 0.2, 0.05,
+        disabled=is_responses, help="gpt-5*, gpt-4.1* では無効（固定）"
+    )
+
+    # 出力トークン上限
+    max_tokens = st.slider("最大出力トークン（目安）", 256, 4000, 1200, 64)
+
+    answer_backend = st.radio("回答生成", ["OpenAI", "Retrieve-only"], index=0)
     sys_inst = st.text_area("System Instruction", "あなたは優秀な社内のアシスタントです.", height=80)
 
     # シャード選択
@@ -192,18 +165,18 @@ with st.sidebar:
     shard_ids_all = [p.name for p in shard_dirs_all]
     target_shards = st.multiselect("（未選択=すべて）", shard_ids_all, default=shard_ids_all)
 
-    # --- 参照ファイル（任意）: 例 "2025/foo.pdf, 2024/bar.pdf"
-    st.caption("特定ファイルだけで検索したい場合は、年/ファイル名 でカンマ区切り指定（例: 2025/foo.pdf, 2024/bar.pdf）")
+    # 参照ファイル
+    st.caption("特定ファイルだけで検索したい場合: 年/ファイル名 をカンマ区切り（例: 2025/foo.pdf, 2024/bar.pdf）")
     file_whitelist_str = st.text_input("参照ファイル（任意）", value="")
     file_whitelist = {s.strip() for s in file_whitelist_str.split(",") if s.strip()}
 
-    # OpenAI キーが無いならここで警告表示（secrets.toml → env の順）
+    # OpenAIキー確認
     has_key = bool(_get_openai_api_key())
     if answer_backend == "OpenAI" and not has_key:
         st.error("OpenAI APIキーが secrets.toml / 環境変数にありません（自動で『Retrieve-only』に切替）。")
 
+    # 🧪 サンプル質問
     st.divider()
-    # サンプル質問
     st.subheader("🧪 デモ用サンプル質問")
     cat = st.selectbox("カテゴリを選択", ["（未選択）"] + list(SAMPLES.keys()))
     sample = ""
@@ -219,20 +192,21 @@ with st.sidebar:
     with cols_demo[1]:
         st.button("🎲 ランダム挿入", use_container_width=True,
                   on_click=lambda: _set_question(random.choice(ALL_SAMPLES)))
-
     send_now = st.button("🚀 サンプルで即送信", use_container_width=True,
                          disabled=(st.session_state.q.strip() == ""))
 
+    # 料金計算（/1K 換算済みの単価を適用：表示用）
     st.divider()
-    # 料金計算
-    st.subheader("💵 料金計算（編集可）")
-    fx_rate = st.number_input("為替レート (JPY/USD)", min_value=50.0, max_value=500.0, value=150.0, step=0.5)
-    chat_in_price = st.number_input("Chat 入力単価 (USD / 1K tok)", min_value=0.0, value=0.00015, step=0.00001, format="%.5f")
-    chat_out_price = st.number_input("Chat 出力単価 (USD / 1K tok)", min_value=0.0, value=0.00060, step=0.00001, format="%.5f")
-    emb_price = st.number_input("Embedding 単価 (USD / 1K tok)", min_value=0.0, value=0.00002, step=0.00001, format="%.5f")
+    st.subheader("💵 料金計算（/1K tok 換算・表示）")
+    # 為替の入力欄は削除。常に DEFAULT_USDJPY を使用。
+    chat_in_price  = float(MODEL_PRICES_PER_1K.get(chat_model, {}).get("in", 0.0))
+    chat_out_price = float(MODEL_PRICES_PER_1K.get(chat_model, {}).get("out", 0.0))
+    default_emb_model = "text-embedding-3-large"
+    emb_price_per_1k = float(EMBEDDING_PRICES_USD.get(default_emb_model, 0.0)) / 1000.0
 
 # 入力欄
-q = st.text_area("質問を入力", value=st.session_state.q, placeholder="この社内ボットに質問してください…", height=100)
+q = st.text_area("質問を入力", value=st.session_state.q,
+                 placeholder="この社内ボットに質問してください…", height=100)
 if q != st.session_state.q:
     st.session_state.q = q
 
@@ -244,34 +218,30 @@ go = go_click or bool(locals().get("send_now"))
 # =========================
 if go and st.session_state.q.strip():
 
-    # --- 埋め込み backend の安全化（OpenAIキー未設定なら local に切替）
+    # 埋め込み backend の安全化
     if embed_backend == "openai" and not _get_openai_api_key():
         st.warning("埋め込みバックエンドが openai ですが APIキー未設定のため、'local' に自動切替します。")
         embed_backend = "local"
 
-    # --- インライン指定の取り出し: [[files: 2025/aaa.pdf, 2024/bbb.pdf]]
+    # インライン参照ファイル: [[files: ...]]
     inline = re.search(r"\[\[\s*files\s*:\s*([^\]]+)\]\]", st.session_state.q, flags=re.IGNORECASE)
     inline_files = set()
     if inline:
         inline_files = {s.strip() for s in inline.group(1).split(",") if s.strip()}
 
-    # UI入力と統合（どちらか/両方OK）→ 正規化
-    effective_whitelist_raw = set(file_whitelist) | set(inline_files)
-    effective_whitelist = {_norm_path(x) for x in effective_whitelist_raw}
-
-    # インラインタグは本文から除去 → 正規化へ
+    effective_whitelist = {_norm_path(x) for x in (set(file_whitelist) | set(inline_files))}
     clean_q = re.sub(r"\[\[\s*files\s*:[^\]]+\]\]", "", st.session_state.q, flags=re.IGNORECASE).strip()
 
-    # ★ クエリ正規化（日本語の1字空白対策）
+    # クエリ正規化
     question = normalize_ja_text(clean_q)
 
-    # 使うベクトルストアのルート（シャード横断）
+    # ベクトルストアのルート
     vs_backend_dir = VS_ROOT / embed_backend
     if not vs_backend_dir.exists():
         st.warning(f"ベクトルが見つかりません（{vs_backend_dir}）。先に **ベクトル化** を同じバックエンドで実行してください。")
         st.stop()
 
-    shard_dirs_all = _list_shard_dirs(embed_backend)  # 念のため再取得（実行時変更対策）
+    shard_dirs_all = _list_shard_dirs(embed_backend)
     selected = [vs_backend_dir / s for s in target_shards] if target_shards else [vs_backend_dir / p.name for p in shard_dirs_all]
     shard_dirs = [p for p in selected if p.is_dir() and (p / "vectors.npy").exists()]
 
@@ -282,28 +252,26 @@ if go and st.session_state.q.strip():
     try:
         # --- 検索 ---
         with st.spinner("検索中…"):
-            # EmbeddingStore が env を見る実装なら、念のため secrets から注入しておく
+            # OpenAI キーを env に注入（EmbeddingStore が env を参照する前提）
             api_key = _get_openai_api_key()
             if api_key and "OPENAI_API_KEY" not in os.environ:
                 os.environ["OPENAI_API_KEY"] = api_key
 
             estore = EmbeddingStore(backend=embed_backend)
-            emb_tokens = _count_tokens(question, model_hint="text-embedding-3-small") if embed_backend == "openai" else 0
+            # OpenAI埋め込み時だけ概算トークン計測（料金の目安）
+            emb_tokens = _count_tokens(question, model_hint="text-embedding-3-large") if embed_backend == "openai" else 0
             qv = estore.embed([question]).astype("float32")  # shape=(1, d)
 
-            # 各シャードで top_k を取り、全体でマージ（最小ヒープ）
+            # 各シャード top-k → 全体マージ（スコア大ほど良い）
             K = int(top_k)
-            # (score, tiebreak, row_idx, meta) として積む：score 同点でも dict 比較が起きない
-            heap: List[Tuple[float, int, int, Dict[str, Any]]] = []
+            heap_: List[Tuple[float, int, int, Dict[str, Any]]] = []
             tiebreak = count()
 
             for shp in shard_dirs:
                 try:
-                    vdb = NumpyVectorDB(shp)  # metric の既定は rag_utils 側に依存
-                    # 類似度（大きいほど良い）を返す契約で取得（距離と混在しないよう明示）
+                    vdb = NumpyVectorDB(shp)
                     hits = vdb.search(qv, top_k=K, return_="similarity")
                     for h in hits:
-                        # 戻り値の揺れに対応
                         if isinstance(h, tuple) and len(h) == 3:
                             row_idx, score, meta = h
                         elif isinstance(h, tuple) and len(h) == 2:
@@ -315,34 +283,31 @@ if go and st.session_state.q.strip():
                         md = dict(meta or {})
                         md["shard_id"] = shp.name
 
-                        # ▼ 参照ファイル指定がある場合はここでフィルタ（正規化後の完全一致）
                         if effective_whitelist:
                             if _norm_path(str(md.get("file", ""))) not in effective_whitelist:
                                 continue
 
-                        sc = float(score)  # similarity（大きいほど良い）
+                        sc = float(score)
                         tb = next(tiebreak)
 
-                        if len(heap) < K:
-                            heapq.heappush(heap, (sc, tb, row_idx, md))
+                        if len(heap_) < K:
+                            heapq.heappush(heap_, (sc, tb, row_idx, md))
                         else:
-                            if sc > heap[0][0]:
-                                heapq.heapreplace(heap, (sc, tb, row_idx, md))
+                            if sc > heap_[0][0]:
+                                heapq.heapreplace(heap_, (sc, tb, row_idx, md))
                 except Exception as e:
                     st.warning(f"シャード {shp.name} の検索でエラー: {e}")
 
-            # heap 要素は (score, tiebreak, row_idx, meta)
-            raw_hits = [(rid, sc, md) for (sc, _tb, rid, md) in sorted(heap, key=lambda x: x[0], reverse=True)]
+            raw_hits = [(rid, sc, md) for (sc, _tb, rid, md) in sorted(heap_, key=lambda x: x[0], reverse=True)]
 
         if not raw_hits:
             if effective_whitelist:
-                st.warning("指定された参照ファイル内で該当コンテキストが見つかりませんでした。"
-                           "ファイル名と年（例: 2025/foo.pdf）をご確認ください。")
+                st.warning("指定された参照ファイル内で該当コンテキストが見つかりませんでした。年/ファイル名（例: 2025/foo.pdf）をご確認ください。")
             else:
                 st.warning("該当コンテキストが見つかりませんでした。チャンクサイズや Top-K を調整して再試行してください。")
             st.stop()
 
-        # 画面表示用
+        # 表示用
         contexts_display = []
         for i, (row_idx, score, meta) in enumerate(raw_hits, 1):
             txt = str(meta.get("text", "") or "")
@@ -354,37 +319,82 @@ if go and st.session_state.q.strip():
         chat_completion_tokens = 0
         answer = None
 
-        # OpenAI キーが無いなら自動で Retrieve-only に切替
         use_answer_backend = "Retrieve-only" if (answer_backend == "OpenAI" and not _get_openai_api_key()) else answer_backend
 
         if use_answer_backend == "OpenAI":
             with st.spinner("回答生成中…"):
-                labeled_contexts = _format_contexts_for_prompt(raw_hits)
+                labeled_contexts = [
+                    f"[S{i}] {meta.get('text','')}\n[meta: {_fmt_source(meta)} / score={float(score):.3f}]"
+                    for i, (_rid, score, meta) in enumerate(raw_hits, 1)
+                ]
+                # strict=False にして文脈活用を強める
                 prompt = build_prompt(
                     question,
                     labeled_contexts,
                     sys_inst=sys_inst,
                     style_hint=detail,
                     cite=cite,
-                    strict=True,
+                    strict=False,
                 )
-                client = OpenAI(api_key=_get_openai_api_key() or "")  # secrets.toml のキーを使用
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    temperature=float(temperature),
-                    max_tokens=int(max_tokens),
-                    messages=[
-                        {"role": "system", "content": "Follow the user's instruction carefully and answer in Japanese when possible."},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                answer = resp.choices[0].message.content
-                try:
-                    chat_prompt_tokens = int(resp.usage.prompt_tokens or 0)
-                    chat_completion_tokens = int(resp.usage.completion_tokens or 0)
-                except Exception:
-                    chat_prompt_tokens = _count_tokens(prompt, model_hint="gpt-4o-mini")
-                    chat_completion_tokens = _count_tokens(answer or "", model_hint="gpt-4o-mini")
+
+                client = OpenAI(api_key=_get_openai_api_key() or "")
+
+                if _use_responses_api(chat_model):
+                    # ---------- Responses API ----------
+                    try:
+                        resp = client.responses.create(
+                            model=chat_model,
+                            input=[
+                                {"role": "system", "content": sys_inst},
+                                {"role": "user", "content": prompt},
+                            ],
+                            max_output_tokens=int(max_tokens),
+                        )
+                    except TypeError:
+                        resp = client.responses.create(
+                            model=chat_model,
+                            input=[
+                                {"role": "system", "content": sys_inst},
+                                {"role": "user", "content": prompt},
+                            ],
+                        )
+
+                    # 出力抽出（フォールバック）
+                    try:
+                        answer = resp.output_text
+                    except Exception:
+                        try:
+                            answer = resp.output[0].content[0].text
+                        except Exception:
+                            answer = str(resp)
+
+                    # 使用トークン
+                    try:
+                        usage = getattr(resp, "usage", None)
+                        if usage:
+                            chat_prompt_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+                            chat_completion_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+                    except Exception:
+                        pass
+
+                else:
+                    # ---------- Chat Completions API ----------
+                    resp = client.chat.completions.create(
+                        model=chat_model,
+                        temperature=float(temperature),
+                        max_tokens=int(max_tokens),
+                        messages=[
+                            {"role": "system", "content": "Follow the user's instruction carefully and answer in Japanese when possible."},
+                            {"role": "user", "content": prompt},
+                        ],
+                    )
+                    answer = resp.choices[0].message.content
+                    try:
+                        chat_prompt_tokens = int(resp.usage.prompt_tokens or 0)
+                        chat_completion_tokens = int(resp.usage.completion_tokens or 0)
+                    except Exception:
+                        chat_prompt_tokens = _count_tokens(prompt, model_hint="cl100k_base")
+                        chat_completion_tokens = _count_tokens(answer or "", model_hint="cl100k_base")
 
             st.subheader("🧠 回答")
             st.write(answer)
@@ -392,39 +402,51 @@ if go and st.session_state.q.strip():
             st.subheader("🧩 取得のみ（要約なし）")
             st.info("Retrieve-only モードです。下の参照コンテキストを参照してください。")
 
-        # --- 料金計算（概算） ---
+        # --- 料金計算（lib/costs.py を使用） ---
         with st.container():
-            emb_cost_usd = (emb_tokens / 1000.0) * float(emb_price) if embed_backend == "openai" else 0.0
+            # Embedding（OpenAIバックエンドの時のみ）
+            emb_cost_usd = 0.0
+            if embed_backend == "openai":
+                # estimate_embedding_cost は /1M 単価ベースで内部計算
+                emb_cost_usd = estimate_embedding_cost(default_emb_model, emb_tokens)["usd"]
+
+            # Chat（OpenAI で回答生成した時のみ）
             chat_cost_usd = 0.0
             if use_answer_backend == "OpenAI":
-                chat_cost_usd = (chat_prompt_tokens / 1000.0) * float(chat_in_price) + \
-                                (chat_completion_tokens / 1000.0) * float(chat_out_price)
-            total_usd = emb_cost_usd + chat_cost_usd
-            total_jpy = total_usd * float(fx_rate)
+                chat_cost_usd = estimate_chat_cost(
+                    chat_model,
+                    ChatUsage(input_tokens=chat_prompt_tokens, output_tokens=chat_completion_tokens)
+                )["usd"]
 
-            st.markdown("### 💴 使用料の概算")
+            total_usd = emb_cost_usd + chat_cost_usd
+            total_jpy = usd_to_jpy(total_usd, rate=DEFAULT_USDJPY)
+
+            st.markdown("### 💴 使用料の概算（lib/costs による集計）")
             cols = st.columns(3)
             with cols[0]:
                 st.metric("合計 (JPY)", f"{total_jpy:,.2f} 円")
-                st.caption(f"為替 {float(fx_rate):.2f} JPY/USD")
+                st.caption(f"為替 {DEFAULT_USDJPY:.2f} JPY/USD")
             with cols[1]:
                 st.write("**内訳 (USD)**")
-                st.write(f"- Embedding: `${emb_cost_usd:.6f}` ({emb_tokens} tok)")
+                st.write(f"- Embedding: `${emb_cost_usd:.6f}`"
+                         + (f"  ({emb_tokens} tok)" if embed_backend == 'openai' else ""))
                 if use_answer_backend == "OpenAI":
-                    st.write(f"- Chat 入力: `${(chat_prompt_tokens/1000.0)*float(chat_in_price):.6f}` ({chat_prompt_tokens} tok)")
-                    st.write(f"- Chat 出力: `${(chat_completion_tokens/1000.0)*float(chat_out_price):.6f}` ({chat_completion_tokens} tok)")
+                    st.write(f"- Chat 合計: `${chat_cost_usd:.6f}` "
+                             f"(in={chat_prompt_tokens} tok / out={chat_completion_tokens} tok)")
                 st.write(f"- 合計: `${total_usd:.6f}`")
             with cols[2]:
                 st.write("**単価 (USD / 1K tok)**")
-                st.write(f"- Embedding: `${float(emb_price):.5f}`")
-                st.write(f"- Chat 入力: `${float(chat_in_price):.5f}`")
-                st.write(f"- Chat 出力: `${float(chat_out_price):.5f}`")
+                st.write(f"- Embedding: `${emb_price_per_1k:.5f}`（{default_emb_model}）")
+                st.write(f"- Chat 入力: `${MODEL_PRICES_PER_1K.get(chat_model,{}).get('in',0.0):.5f}`（{chat_model}）")
+                st.write(f"- Chat 出力: `${MODEL_PRICES_PER_1K.get(chat_model,{}).get('out',0.0):.5f}`（{chat_model}）")
 
-        # --- 参照コンテキスト（折りたたみ） ---
+        # --- 参照コンテキスト ---
         with st.expander("🔍 参照コンテキスト（上位ヒット）", expanded=False):
-            for i, txt, src_label, score in contexts_display:
-                snippet = (txt[:1000] + "…") if len(txt) > 1000 else txt  # 体感軽量化
-                st.markdown(f"**[S{i}] score={score:.3f}**  `{src_label}`\n\n{snippet}")
+            for i, (_rid, score, meta) in enumerate(raw_hits, 1):
+                txt = str(meta.get("text", "") or "")
+                src_label = _fmt_source(meta)
+                snippet = (txt[:1000] + "…") if len(txt) > 1000 else txt
+                st.markdown(f"**[S{i}] score={float(score):.3f}**  `{src_label}`\n\n{snippet}")
 
     except Exception as e:
         st.error(f"検索/生成中にエラー: {e}")

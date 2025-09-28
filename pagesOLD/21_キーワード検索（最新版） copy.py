@@ -1,9 +1,9 @@
 # pages/20_キーワード検索.py
 # ------------------------------------------------------------
-# 🔎 meta.jsonl 横断検索 + （任意）OpenAI 生成要約（ボタンで実行）
+# 🔎 meta.jsonl 横断検索 + OpenAI 生成要約（ボタン押下で実行・スピナー付き）
 # - バックエンドは OpenAI 固定（vectorstore/openai）
-# - 検索結果（表・スニペット）は常に表示されたまま
-# - 要約は「🧠 要約を生成」ボタン押下時のみ実行（OpenAI未設定や失敗時はローカル抽出に自動フォールバック）
+# - OpenAI未設定や失敗時はローカル抽出サマリへ自動フォールバック
+# - 検索結果は session_state に保持し、要約ボタン押下の rerun でも再利用
 # ------------------------------------------------------------
 from __future__ import annotations
 from pathlib import Path
@@ -37,19 +37,14 @@ def make_snippet(text: str, pats: List[re.Pattern], total_len: int = 240) -> str
     left, right = max(0, pos[0] - total_len // 2), min(len(text), pos[1] + total_len // 2)
     snip = text[left:right]
     for p in pats:
-        try:
-            snip = p.sub(lambda m: f"<mark>{m.group(0)}</mark>", snip)
-        except re.error:
-            pass
+        snip = p.sub(lambda m: f"<mark>{m.group(0)}</mark>", snip)
     return ("…" if left else "") + snip + ("…" if right < len(text) else "")
 
 def _encoding_for(model_hint: str):
     try:
         import tiktoken
-        try:
-            return tiktoken.encoding_for_model(model_hint)
-        except Exception:
-            return tiktoken.get_encoding("cl100k_base")
+        try: return tiktoken.encoding_for_model(model_hint)
+        except Exception: return tiktoken.get_encoding("cl100k_base")
     except Exception:
         return None
 
@@ -110,7 +105,7 @@ def fit_to_budget(snips: List[str], *, model: str, sys_prompt: str, user_prefix:
     while True:
         toks = count_tokens(sys_prompt, model) + count_tokens(user_prefix, model) + sum(count_tokens(s, model) for s in snips)
         if toks + want_output + safety_margin <= context_limit or not snips: break
-        snips.pop()  # 末尾から間引く
+        snips.pop()
     if snips:
         budget = max(500, context_limit - (count_tokens(sys_prompt, model) + count_tokens(user_prefix, model) + want_output + safety_margin))
         snips = [s if count_tokens(s, model) <= budget else truncate_by_tokens(s, budget, model) for s in snips]
@@ -188,9 +183,10 @@ with c4: case_sensitive = st.checkbox("大文字小文字を区別", value=False
 with c5: normalize_query = st.checkbox("日本語スペース正規化（推奨）", value=True)
 with c6: norm_body = st.checkbox("本文も正規化して検索", value=True, help="取り込み時に正規化していないコーパス向け")
 
+# 検索実行
 go = st.button("検索を実行", type="primary")
 
-# ============== 検索の実行（結果は session_state に保存） ==============
+# ============== 検索処理 ==============
 if go:
     try:
         if not sel_shards: st.warning("少なくとも1つのシャードを選択してください。"); st.stop()
@@ -230,127 +226,102 @@ if go:
 
         if not rows: st.warning("ヒットなし。検索語やフィルタを調整してください。"); st.stop()
 
-        # 検索結果と設定を保存（要約ボタン後の再描画で使う）
+        # 検索結果を保存（要約ボタンの rerun に備える）
         st.session_state["kw_rows"] = rows
-        st.session_state["kw_scanned"] = total_scanned
-        st.session_state["kw_show_order"] = [c for c in show_cols if c in rows[0].keys()] or ["file","year","page","shard_id","score","text"]
-        st.session_state["kw_sort_cols"] = ["score","year","file","page"]
-        st.session_state["kw_query"] = query
+        st.session_state["kw_sorted_cols"] = ["score","year","file","page"]
 
-        # 要約用の設定も保存
-        st.session_state["kw_gen_cfg"] = dict(
-            OPENAI_API_KEY=OPENAI_API_KEY, model=model, temperature=float(temperature),
-            max_tokens=int(max_tokens), topn=int(topn_snippets),
-            sys_prompt=sys_prompt, user_prompt_tpl=user_prompt_tpl,
-        )
+        df = pd.DataFrame(rows).sort_values(st.session_state["kw_sorted_cols"], ascending=[False, True, True, True])
+        st.success(f"ヒット {len(df):,d} 件 / 走査 {total_scanned:,d} レコード（上位のみ表示）")
 
-        st.success(f"ヒット {len(rows):,d} 件 / 走査 {total_scanned:,d} レコード（上位のみ表示）")
+        show_order = [c for c in show_cols if c in df.columns] or ["file","year","page","shard_id","score","text"]
+        st.dataframe(df[[c for c in show_order if c != "text"]], use_container_width=True, height=420)
+
+        csv_bytes = df[show_order].to_csv(index=False).encode("utf-8-sig")
+        st.download_button("📥 CSV をダウンロード", data=csv_bytes, file_name="keyword_hits.csv", mime="text/csv")
+
+        # ヒットスニペット
+        if "text" in show_order:
+            st.divider()
+            with st.expander("ヒットスニペット（クリックで展開）", expanded=False):
+                for i, row in df.head(200).iterrows():
+                    colA, colB = st.columns([4,1])
+                    with colA:
+                        st.markdown(
+                            f"**{row.get('file')}**  year={row.get('year')}  p.{row.get('page')}  score={row.get('score')}",
+                            help=row.get("chunk_id")
+                        )
+                        st.markdown(row.get("text",""), unsafe_allow_html=True)
+                    with colB:
+                        payload = json.dumps(str(row.get("file")), ensure_ascii=False)
+                        st.components.v1.html(f"""
+                        <button id="cpy_{i}" style="padding:6px 10px;border-radius:8px;border:1px solid #dadce0;background:#fff;cursor:pointer;font-size:0.9rem;">📋 year/file をコピー</button>
+                        <script>
+                          const b=document.getElementById("cpy_{i}");
+                          b&&b.addEventListener("click",async()=>{{
+                            try{{await navigator.clipboard.writeText({payload});
+                              const o=b.innerText;b.innerText="✅ コピーしました";setTimeout(()=>{{b.innerText=o}},1200);
+                            }}catch(e){{alert("コピーに失敗: "+e)}}
+                          }});
+                        </script>
+                        """, height=38)
 
     except Exception:
         st.error("検索処理でエラーが発生しました。", icon="🛑")
-        if st.session_state.get("kw_gen_cfg", {}).get("debug_mode", False) or debug_mode:
-            st.code("".join(traceback.format_exc()))
+        if debug_mode: st.code("".join(traceback.format_exc()))
 
-# ============== 共通描画ブロック（検索直後 / ボタン押下後の両方で実行） ==============
+# ============== 🧠 要約ボタン＆生成処理（検索後いつでも押せる） ==============
 if st.session_state.get("kw_rows"):
-    rows_saved: List[Dict[str, Any]] = st.session_state["kw_rows"]
-    sort_cols = st.session_state.get("kw_sort_cols", ["score","year","file","page"])
-    show_order = st.session_state.get("kw_show_order", ["file","year","page","shard_id","score","text"])
-    df = pd.DataFrame(rows_saved).sort_values(sort_cols, ascending=[False, True, True, True])
-
-    # 1) ヒット一覧（表）
-    st.dataframe(df[[c for c in show_order if c != "text"]], use_container_width=True, height=420)
-
-    # 2) CSV ダウンロード
-    csv_bytes = df[show_order].to_csv(index=False).encode("utf-8-sig")
-    st.download_button("📥 CSV をダウンロード", data=csv_bytes, file_name="keyword_hits.csv", mime="text/csv")
-
-    # 3) ヒットスニペット（常に表示されたまま）
-    if "text" in show_order:
-        st.divider()
-        with st.expander("ヒットスニペット（クリックで展開）", expanded=False):
-            for i, row in df.head(200).iterrows():
-                colA, colB = st.columns([4,1])
-                with colA:
-                    st.markdown(
-                        f"**{row.get('file')}**  year={row.get('year')}  p.{row.get('page')}  score={row.get('score')}",
-                        help=row.get("chunk_id")
-                    )
-                    st.markdown(row.get("text",""), unsafe_allow_html=True)
-                with colB:
-                    payload = json.dumps(str(row.get("file")), ensure_ascii=False)
-                    st.components.v1.html(f"""
-                    <button id="cpy_{i}" style="padding:6px 10px;border-radius:8px;border:1px solid #dadce0;background:#fff;cursor:pointer;font-size:0.9rem;">📋 year/file をコピー</button>
-                    <script>
-                      const b=document.getElementById("cpy_{i}");
-                      b&&b.addEventListener("click",async()=>{{
-                        try{{await navigator.clipboard.writeText({payload});
-                          const o=b.innerText;b.innerText="✅ コピーしました";setTimeout(()=>{{b.innerText=o}},1200);
-                        }}catch(e){{alert("コピーに失敗: "+e)}}
-                      }});
-                    </script>
-                    """, height=38)
-
-    # 4) 🧠 要約ボタン
     st.divider()
     gen_clicked = st.button("🧠 要約を生成", type="primary", use_container_width=True)
-
     if gen_clicked:
-        # 保存済み設定の読込
-        cfg = st.session_state.get("kw_gen_cfg", {})
-        OPENAI_API_KEY = cfg.get("OPENAI_API_KEY")
-        model = cfg.get("model", "gpt-5-mini")
-        temperature = cfg.get("temperature", 1.0 if is_gpt5(model) else 0.2)
-        max_tokens = cfg.get("max_tokens", 2000)
-        topn_snippets = cfg.get("topn", 30)
-        sys_prompt = cfg.get("sys_prompt", "あなたは事実に忠実なリサーチアシスタントです。日本語で簡潔にまとめてください。")
-        user_prompt_tpl = cfg.get("user_prompt_tpl", "クエリ『{query}』\n{snippets}")
-        query = st.session_state.get("kw_query", "")
+        try:
+            # 保存済み rows から DF を再構築（並び順も再現）
+            rows_saved: List[Dict[str, Any]] = st.session_state["kw_rows"]
+            sort_cols = st.session_state.get("kw_sorted_cols", ["score","year","file","page"])
+            df_saved = pd.DataFrame(rows_saved).sort_values(sort_cols, ascending=[False, True, True, True])
 
-        # スニペット準備
-        labelled = [
-            f"---\n# Source: {r.get('file')} p.{r.get('page')} (score={r.get('score')})\n{strip_html(str(r.get('text','')))}"
-            for _, r in df.head(int(topn_snippets)).iterrows()
-        ]
+            # ラベル付きスニペット
+            labelled = [
+                f"---\n# Source: {r.get('file')} p.{r.get('page')} (score={r.get('score')})\n{strip_html(str(r.get('text','')))}"
+                for _, r in df_saved.head(int(topn_snippets)).iterrows()
+            ]
 
-        # 予算合わせ
-        user_prefix = user_prompt_tpl.replace("{snippets}", "").format(query=query, snippets="")
-        context_limit, safety_margin = (128_000, 2_000) if is_gpt5(model) else (128_000, 1_000)
-        fitted = fit_to_budget(
-            labelled, model=model, sys_prompt=sys_prompt, user_prefix=user_prefix,
-            want_output=int(max_tokens), context_limit=context_limit, safety_margin=safety_margin
-        )
+            # 予算合わせ
+            user_prefix = user_prompt_tpl.replace("{snippets}", "").format(query=query, snippets="")
+            context_limit, safety_margin = (128_000, 2_000) if is_gpt5(model) else (128_000, 1_000)
+            fitted = fit_to_budget(labelled, model=model, sys_prompt=sys_prompt, user_prefix=user_prefix,
+                                   want_output=int(max_tokens), context_limit=context_limit, safety_margin=safety_margin)
 
-        # 要約の実行（OpenAI → フォールバック）
-        st.subheader("🧠 生成要約")
-        if not fitted:
-            with st.spinner("🧩 ローカル抽出サマリを生成中…"):
-                st.markdown(local_summary(labelled, max_sent=12))
-        else:
-            snippets_text = "\n\n".join(fitted)
-            user_prompt = user_prompt_tpl.format(query=query, snippets=snippets_text)
-            approx_in = count_tokens(user_prompt, model) + count_tokens(sys_prompt, model)
-            st.caption(f"（推定入力 ~{approx_in:,} tok / 出力上限 {int(max_tokens):,} tok / コンテキスト~{context_limit:,} tok）")
-
-            try:
-                with st.spinner("🧠 要約を生成中…"):
-                    out = openai_summary(
-                        model=model, temperature=float(temperature), max_tokens=int(max_tokens),
-                        sys_prompt=sys_prompt, user_prompt=user_prompt, api_key=OPENAI_API_KEY
-                    )
-                if str(out).strip():
-                    st.markdown(str(out).strip())
-                else:
-                    with st.spinner("🧩 ローカル抽出サマリを生成中…"):
-                        st.info("⚠️ モデル出力が空だったため、ローカル抽出サマリを表示します。")
-                        st.markdown(local_summary(fitted, max_sent=12))
-            except Exception as e:
-                if debug_mode:
-                    st.error(f"OpenAI エラー: {type(e).__name__}: {e}", icon="🛑")
-                    st.code("".join(traceback.format_exc()))
+            st.subheader("🧠 生成要約")
+            if not fitted:
                 with st.spinner("🧩 ローカル抽出サマリを生成中…"):
-                    st.markdown(local_summary(fitted, max_sent=12))
+                    st.markdown(local_summary(labelled, max_sent=12))
+            else:
+                snippets_text = "\n\n".join(fitted)
+                user_prompt = user_prompt_tpl.format(query=query, snippets=snippets_text)
+                approx_in = count_tokens(user_prompt, model) + count_tokens(sys_prompt, model)
+                st.caption(f"（推定入力 ~{approx_in:,} tok / 出力上限 {int(max_tokens):,} tok / コンテキスト~{context_limit:,} tok）")
 
-# ============== 初期ガイダンス ==============
-if not st.session_state.get("kw_rows"):
+                try:
+                    with st.spinner("🧠 要約を生成中…"):
+                        out = openai_summary(
+                            model=model, temperature=float(temperature), max_tokens=int(max_tokens),
+                            sys_prompt=sys_prompt, user_prompt=user_prompt, api_key=OPENAI_API_KEY
+                        )
+                    if str(out).strip():
+                        st.markdown(str(out).strip())
+                    else:
+                        with st.spinner("🧩 ローカル抽出サマリを生成中…"):
+                            st.info("⚠️ モデル出力が空だったため、ローカル抽出サマリを表示します。")
+                            st.markdown(local_summary(fitted, max_sent=12))
+                except Exception as e:
+                    if debug_mode:
+                        st.error(f"OpenAI エラー: {type(e).__name__}: {e}", icon="🛑")
+                        st.code("".join(traceback.format_exc()))
+                    with st.spinner("🧩 ローカル抽出サマリを生成中…"):
+                        st.markdown(local_summary(fitted, max_sent=12))
+        except Exception:
+            st.error("要約処理でエラーが発生しました。", icon="🛑")
+            if debug_mode: st.code("".join(traceback.format_exc()))
+else:
     st.info("左のサイドバーで条件を設定し、キーワードを入力して『検索を実行』してください。")

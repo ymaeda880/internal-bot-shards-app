@@ -1,8 +1,10 @@
 import streamlit as st
+from lib.ui import hide_deploy_button
 #from dotenv import load_dotenv
 
 #load_dotenv()
 st.set_page_config(page_title="社内ボット (No-FAISS版)", page_icon="🤖", layout="wide")
+hide_deploy_button()   # ← 最上部で1回呼ぶ
 
 st.title("🤖 社内ボット (no-FAISS版)")
 st.markdown("""
