@@ -25,3 +25,71 @@ backend は UI のラジオで選択（例：openai or local）。バックエ�
 
 - バックアップデータの場所：ssd_path/bot_data/backup
 - vectorestore の場所は今まで通り
+
+# フォルダー構成
+
+## Mac
+
+### アプリ関連
+
+- アプリ本体：$Home/myVenv/myProject/internal_bot_shards_app
+- データベース：
+- データ：
+
+```
+/Users/appuser/apps/myapp/
+├─ app.py
+├─ venv/
+├─ .streamlit/
+│   └─ secrets.toml   # /Volumes/MySSD/... を指定
+└─ logs/   -> /Volumes/MySSD/myapp/logs
+
+/Volumes/BotSSD/myapp/vectorstore/
+├─ faiss/
+│   └─ corp-legal/
+│       ├─ vectors-0001.npy
+│       ├─ meta-0001.jsonl
+│       └─ index.faiss
+└─ numpy/
+    └─ reports-2025/
+        ├─ vectors.npy
+        └─ meta.jsonl
+
+```
+
+### データベース関連
+
+- 契約書フォルダー：contrancts（例：contrancts_2025：2025 年度の契約書）
+  - 契約書，仕様書，注文書，請書
+-
+- 報告書：reports（例：reports_2025：2025 年度の報告書）
+-
+- pdf フォルダーの中にそれらを入れる
+- オリジナルファイルは doc フォルダーの中に全部入れる
+
+## サーバー
+
+### アプリ関連
+
+```
+/home/appuser/apps/myapp/
+├─ app.py
+├─ venv/
+├─ .streamlit/
+│   └─ secrets.toml   # /mnt/ssd/... を指定
+└─ logs/   -> /mnt/ssd/myapp/logs
+
+/mnt/ssd/myapp/vectorstore/
+├─ faiss/
+│   └─ corp-legal/
+│       ├─ vectors-0001.npy
+│       ├─ meta-0001.jsonl
+│       └─ index.faiss
+└─ numpy/
+    └─ reports-2025/
+        ├─ vectors.npy
+        └─ meta.jsonl
+
+```
+
+-

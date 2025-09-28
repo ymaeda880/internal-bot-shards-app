@@ -1,7 +1,7 @@
 import streamlit as st
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 
-load_dotenv()
+#load_dotenv()
 st.set_page_config(page_title="社内ボット (No-FAISS版)", page_icon="🤖", layout="wide")
 
 st.title("🤖 社内ボット (no-FAISS版)")

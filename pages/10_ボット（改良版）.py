@@ -38,7 +38,7 @@ import numpy as np
 from openai import OpenAI
 
 from lib.rag_utils import EmbeddingStore, NumpyVectorDB, build_prompt
-from config.config import PATHS  # VS_ROOT を設定ファイルから取得
+from config.path_config import PATHS  # VS_ROOT を設定ファイルから取得
 # 価格とモデル一覧を pricing.py から使用（MODEL_PRICES_USD は USD / 1M tokens）
 from config.pricing import MODEL_PRICES_USD, EMBEDDING_PRICES_USD, DEFAULT_USDJPY
 

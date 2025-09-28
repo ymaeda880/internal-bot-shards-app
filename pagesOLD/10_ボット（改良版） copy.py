@@ -41,7 +41,7 @@ import numpy as np
 from openai import OpenAI
 
 from lib.rag_utils import EmbeddingStore, NumpyVectorDB, build_prompt
-from config.config import PATHS  # ★ VS_ROOT を設定ファイルから取得
+from config.path_config import PATHS  # ★ VS_ROOT を設定ファイルから取得
 
 # ========= パス =========
 VS_ROOT: Path = PATHS.vs_root  # 例: <project>/data/vectorstore

@@ -1,16 +1,21 @@
+# app
 streamlit
 python-dotenv
 numpy
-sentence-transformers
-openai>=1.40.0
+pandas
 tiktoken
+openai>=1.40.0
 
-# pdf text extraction
+# （必要なら）埋め込み・モデルユーティリティ
+sentence-transformers
+
+# PDFテキスト抽出
 pdfplumber
 
-# ocr (optional)
+# OCR（必要な人だけ）
+pillow
 pdf2image
 pytesseract
-pillow
 
+# Word 出力
 python-docx

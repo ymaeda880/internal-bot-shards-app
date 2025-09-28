@@ -21,7 +21,7 @@ import pdfplumber
 import numpy as np
 import tiktoken
 
-from config.config import PATHS, AVAILABLE_PRESETS, resolve_paths_for
+from config.path_config import PATHS, AVAILABLE_PRESETS, resolve_paths_for
 from config import pricing
 from lib.rag_utils import split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
 from lib.vectorstore_utils import load_processed_files, save_processed_files  # 既存ユーティリティを活用
