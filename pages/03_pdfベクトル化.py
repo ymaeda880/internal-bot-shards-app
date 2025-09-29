@@ -21,11 +21,10 @@ import pdfplumber
 import numpy as np
 import tiktoken
 
-from config.path_config import PATHS, AVAILABLE_PRESETS, resolve_paths_for
+from config.path_config import PATHS
 from config import pricing
 from lib.rag_utils import split_text, EmbeddingStore, NumpyVectorDB, ProcessedFilesSimple
 from lib.vectorstore_utils import load_processed_files, save_processed_files  # 既存ユーティリティを活用
-
 from lib.text_normalize import normalize_ja_text
 
 # ============================================================
@@ -33,11 +32,14 @@ from lib.text_normalize import normalize_ja_text
 # ============================================================
 OPENAI_EMBED_MODEL = "text-embedding-3-large"  # ← 大固定（3072 次元）
 
+# ============================================================
+# tokenizer（large に合わせる）— モデル未登録環境でも安全にフォールバック
+# ============================================================
+try:
+    enc = tiktoken.encoding_for_model(OPENAI_EMBED_MODEL)
+except Exception:
+    enc = tiktoken.get_encoding("cl100k_base")
 
-# ============================================================
-# tokenizer（large に合わせる）
-# ============================================================
-enc = tiktoken.encoding_for_model(OPENAI_EMBED_MODEL)
 def count_tokens(text: str) -> int:
     return len(enc.encode(text))
 
@@ -47,30 +49,18 @@ def count_tokens(text: str) -> int:
 st.set_page_config(page_title="03 ベクトル化（ページ単位・シャード）", page_icon="🧱", layout="wide")
 st.title("🧱 フォルダー（=シャード）ごとのベクトル化（page + year付き）")
 
-# --- サイドバー：location 強調 + ラジオ切替 + 整形表示 ---
+# --- サイドバー：現在のロケーションと解決済みパス（表示のみ）
 with st.sidebar:
-    st.subheader("📓 現在のロケーション")
-    idx0 = AVAILABLE_PRESETS.index(PATHS.preset) if PATHS.preset in AVAILABLE_PRESETS else 0
-    ui_preset = st.radio(
-        "Location（この実行中のみ切替）",
-        AVAILABLE_PRESETS,
-        index=idx0,
-        horizontal=True,
-        help="secrets.toml の [mounts] で定義されたマウントを使用します。",
-    )
-
-EFFECTIVE = resolve_paths_for(ui_preset, PATHS.app_root) if ui_preset != PATHS.preset else PATHS
-
-with st.sidebar:
-    st.markdown(f"### 🧭 Location: **{ui_preset}**")
+    st.subheader("📓 現在のロケーション（固定）")
+    st.markdown(f"**Location:** `{PATHS.preset}`")
     st.markdown("#### 📂 解決パス（コピー可）")
-    st.text_input("ssd_path", str(EFFECTIVE.ssd_path), key="p_ssd", disabled=True)
-    st.text_input("PDF_ROOT", str(EFFECTIVE.pdf_root), key="p_pdf", disabled=True)
-    st.text_input("BACKUP_ROOT", str(EFFECTIVE.backup_root), key="p_bak", disabled=True)
-    st.text_input("VS_ROOT", str(EFFECTIVE.vs_root), key="p_vs", disabled=True)
+    st.text_input("ssd_path", str(PATHS.ssd_path), key="p_ssd", disabled=True)
+    st.text_input("PDF_ROOT", str(PATHS.pdf_root), key="p_pdf", disabled=True)
+    st.text_input("BACKUP_ROOT", str(PATHS.backup_root), key="p_bak", disabled=True)
+    st.text_input("VS_ROOT", str(PATHS.vs_root), key="p_vs", disabled=True)
 
-PDF_ROOT: Path = EFFECTIVE.pdf_root
-VS_ROOT: Path  = EFFECTIVE.vs_root
+PDF_ROOT: Path = PATHS.pdf_root
+VS_ROOT: Path  = PATHS.vs_root
 
 # --- その他 UI ---
 col1, col2, col3 = st.columns([1, 1, 2])
@@ -86,7 +76,7 @@ with col3:
     st.caption("※ OCRが必要なPDFは、事前に検索可能PDF化（ocrmypdf 等）しておくと安定します。")
 
 st.info(
-    "PDF 入力: `<ssd>/bot_data/pdf/<shard>`（location により自動切替）\n"
+    "PDF 入力: `<ssd>/bot_data/pdf/<shard>`（固定PATHSに基づく）\n"
     "出力: `./data/vectorstore/<backend>/<shard>/`（バックエンドごとに分離）"
 )
 

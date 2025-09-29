@@ -1,0 +1,33 @@
+# setting.toml
+# プロジェクト名：internal_bot_shards_app
+
+
+[env]
+# 利用する環境を選択: "Develop" / "Mac" / "Server"
+location = "Develop"
+
+[mounts]
+Mac    = "/Volumes/Extreme SSD"
+Server = "/srv/ssd"
+
+# ===== 環境ごとのルート定義 =====
+
+# Develop（開発環境）: プロジェクト内を利用
+[locations.Develop]
+pdf_root    = "project:pdf"
+backup_root = "project:backup"
+
+# Mac（Mac 運用環境）: 外付けSSDを利用
+[locations.Mac]
+pdf_root    = "mount:Mac/pdf"
+backup_root = "mount:Mac/backup"
+
+# Server（サーバー環境）
+[locations.Server]
+pdf_root    = "mount:Server/pdf"
+backup_root = "mount:Server/backup"
+
+# ===== 共通アプリ設定 =====
+[app]
+available_presets = ["Develop", "Mac", "Server"]
+# bot_bucket        = "bot_data"

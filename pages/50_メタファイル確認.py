@@ -14,12 +14,9 @@ import streamlit as st
 # 共通ユーティリティ（読み込み用のみ使用）
 from lib.vectorstore_utils import iter_jsonl
 
-# ============================================================
-# 基本パス
-# ============================================================
-APP_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = APP_ROOT / "data"
-VS_ROOT  = DATA_DIR / "vectorstore"
+# パス設定は PATHS に一本化
+from config.path_config import PATHS
+VS_ROOT: Path = PATHS.vs_root  # => <project>/data/vectorstore
 
 # ============================================================
 # クリップボードコピー（JS埋め込み）
@@ -59,9 +56,10 @@ st.title("🗂️ メタファイル確認（フォルダー＝シャード）")
 with st.sidebar:
     st.header("読み込み設定")
     backend = st.radio("バックエンド", ["openai", "local"], index=0, horizontal=True)
+
     base_backend_dir = VS_ROOT / backend
     if not base_backend_dir.exists():
-        st.error(f"vectorstore/{backend} が見つかりません。先にベクトル化を実行してください。")
+        st.error(f"{base_backend_dir} が見つかりません。先にベクトル化を実行してください。")
         st.stop()
 
     shard_dirs = sorted([p for p in base_backend_dir.iterdir() if p.is_dir()])
@@ -98,7 +96,7 @@ for col in ["file","page","chunk_id","chunk_index","text","span_start","span_end
 df["chunk_len"] = df["text"].astype(str).str.len()
 
 # 先頭表示
-st.dataframe(df.head(500), use_container_width=True, height=560)
+st.dataframe(df.head(500), width="stretch", height=560)
 st.divider()
 
 # ============================================================

@@ -12,6 +12,7 @@ import re, json, os, traceback
 import pandas as pd
 import streamlit as st
 from lib.text_normalize import normalize_ja_text
+from config.path_config import PATHS  # ← 追加：PATHSに一本化
 
 # OpenAI は任意（生成要約で使用）
 try:
@@ -20,9 +21,8 @@ try:
 except Exception:
     _HAS_OPENAI = False
 
-# ============== パス ==============
-APP_ROOT = Path(__file__).resolve().parents[1]
-BASE_DIR = APP_ROOT / "data" / "vectorstore" / "openai"   # ★ OpenAI 固定
+# ============== パス（PATHSに統一） ==============
+BASE_DIR: Path = PATHS.vs_root / "openai"   # ★ OpenAI 固定
 
 # ============== 基本UI ==============
 st.set_page_config(page_title="20 キーワード検索（meta横断 / OpenAI）", page_icon="🔎", layout="wide")
@@ -166,7 +166,11 @@ with st.sidebar:
 
     model = st.selectbox("モデル", ["gpt-5-mini", "gpt-5", "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"], index=0)
     temperature = 1.0 if is_gpt5(model) else st.slider("temperature", 0.0, 1.0, 0.2, 0.05)
-    max_tokens = st.slider("出力トークン上限", 128, 32000, 2000, 128)
+
+    # 出力トークン上限（Responses は max_output_tokens）
+    # max_tokens = st.slider("出力トークン上限", 128, 32000, 2000, 128)
+    max_tokens = st.slider("最大出力トークン（目安）", 1000, 40000, 12000, 500)
+
     topn_snippets = st.slider("要約に使う上位スニペット数", 5, 200, 30, 5)
     sys_prompt = st.text_area("System Prompt",
         "あなたは事実に忠実なリサーチアシスタントです。根拠のある記述のみを日本語で簡潔にまとめてください。", height=80)

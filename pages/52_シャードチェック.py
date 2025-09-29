@@ -1,7 +1,7 @@
 # pages/52_シャード健全性チェック.py
 # ------------------------------------------------------------
 # 🧩 シャード健全性チェック（容量・件数・整合性）
-# - data/vectorstore/<backend>/<shard_id>/ を走査
+# - PATHS.vs_root/<backend>/<shard_id>/ を走査
 # - vectors.npy の (行数n, 次元d), ファイルサイズ, meta.jsonl行数 を取得
 # - しきい値で OK / WARN / NG を判定（理由つき）
 # - RAM目安から「推奨最大ベクトル数/シャード」を自動試算（可編集）
@@ -15,13 +15,13 @@ import math
 import numpy as np
 import streamlit as st
 
+from config.path_config import PATHS  # 固定パス設定に一本化
+
 # ========== ページ設定 ==========
 st.set_page_config(page_title="Shard Health Check", page_icon="🧩", layout="wide")
 
-# ========== パス規約（既存アプリと同一想定） ==========
-APP_ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = APP_ROOT / "data"
-VS_ROOT  = DATA_DIR / "vectorstore"   # data/vectorstore/<backend>/<shard_id>/
+# ========== パス（PATHS から取得） ==========
+VS_ROOT: Path = PATHS.vs_root  # <project>/data/vectorstore/<backend>/<shard_id>/
 
 # ========== ユーティリティ ==========
 def help_popover(title: str, content_md: str) -> None:
@@ -132,28 +132,8 @@ def plan_split(n: int, max_per_shard: int) -> Tuple[int, List[Tuple[int, int]]]:
         plan.append((cnt, i))
     return k, plan
 
-# ========== タイトル＋ヘルプ ==========
-c1, c2 = st.columns([1, 0.14])
-with c1:
-    st.title("🧩 シャード健全性チェック（容量・件数・整合性）")
-with c2:
-    help_popover(
-        "RAM見積とは？",
-        r"""
-**RAM見積** = ベクトルをメモリに展開したときの概算（GB）。
-
-**計算式**：
-$$
-RAM_{GB}=\frac{n\times d\times 4}{1024^3}
-$$
-- *n*: ベクトル数（行数）  
-- *d*: 次元数（列数）  
-- 4: float32（1要素あたり4バイト）
-
-**例**：300,000 × 768 ≒ 0.86 GB  
-**目的**：搭載RAMと比較し、シャードが大きすぎないかを判定。
-"""
-    )
+# ========== タイトル ==========
+st.title("🧩 シャード健全性チェック（容量・件数・整合性）")
 
 # ========== サイドバー ==========
 with st.sidebar:
@@ -163,7 +143,7 @@ with st.sidebar:
         "埋め込みバックエンド（格納先）",
         ["local (sentence-transformers)", "openai"],
         index=1,
-        help="data/vectorstore/<backend>/ 以下を走査します。",
+        help="PATHS.vs_root/<backend>/ 以下を走査します。",
     )
     backend = "openai" if backend_label.startswith("openai") else "local"
 
@@ -200,6 +180,11 @@ with st.sidebar:
         "確認サンプル抽出（行）", min_value=0, max_value=50, value=0, step=1,
         help="0=抽出しない。meta.jsonl の冒頭を表示します。",
     )
+
+    # 参考表示：解決済みパス
+    st.markdown("### 📂 現在の解決パス（参考）")
+    st.text_input("VS_ROOT", str(VS_ROOT), disabled=True)
+    st.text_input("Backend Dir", str(VS_ROOT / backend), disabled=True)
 
 st.caption(f"スキャン対象: **{VS_ROOT} / {backend}**")
 
@@ -266,6 +251,19 @@ for shp in shards:
     total_ram_est_gb += est_ram_gb
     total_size_bytes += size_bytes  # ← bytesで加算
 
+
+# ========== 現在のパス設定 ==========
+st.subheader("📂 PathConfig によるパス設定")
+
+st.text(f"APP_ROOT     : {PATHS.app_root}")
+st.text(f"vs_root      : {PATHS.vs_root}")
+st.text(f"backup_root  : {PATHS.backup_root}")
+st.text(f"pdf_root     : {PATHS.pdf_root}")
+st.text(f"ssd_path     : {PATHS.ssd_path}")
+
+st.divider()
+
+
 # ========== 表示 ==========
 st.subheader("📊 シャード一覧")
 if not rows:
@@ -276,7 +274,7 @@ if not rows:
 priority = {"NG": 0, "WARN": 1, "OK": 2}
 rows_sorted = sorted(rows, key=lambda r: (priority.get(r["status"], 3), -r["n_vectors"]))
 
-# テーブル上部の補助ヘルプ
+# テーブル上部の補助ヘルプ（上部の重複は削除済・ここだけ残す）
 hc1, hc2 = st.columns([1, 0.18])
 with hc1:
     st.caption("列『RAM見積』は、シャード単体を float32 で展開した場合の概算メモリ量です。")
@@ -314,7 +312,7 @@ for r in rows_sorted:
         "パス": r["path"],
     })
 
-st.dataframe(table, use_container_width=True)
+st.dataframe(table, width="stretch")
 
 # ===== 合計 / 概況（少量でも 0.00GB にならない表示） =====
 st.markdown("### 合計 / 概況")
@@ -364,6 +362,6 @@ else:
         with st.expander(f"分割の運用ヒント: {r['shard_id']}", expanded=False):
             st.markdown(
                 "- 元データの意味のある境界（年別・ファイル群など）で再ベクトル化すると運用が安定します。\n"
-                "- 生成時に new_shard_id を振り直し、`data/vectorstore/<backend>/<new_shard_id>/` に配置してください。\n"
+                f"- 生成時に new_shard_id を振り直し、`{str(VS_ROOT)}/<backend>/<new_shard_id>/` に配置してください。\n"
                 "- 既存の横断検索ページは複数 shard_id を選択可能なので、新構成でも運用できます。"
             )

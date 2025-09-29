@@ -32,6 +32,13 @@ VS_ROOT: Path      = PATHS.vs_root
 BACKUP_ROOT: Path  = PATHS.backup_root
 
 # ============================================================
+# バックアップ先の存在保証（最初のバックアップで失敗しないように）
+# ============================================================
+BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+(VS_ROOT / "openai").mkdir(parents=True, exist_ok=True)   # なくても動きますが安全のため
+(VS_ROOT / "local").mkdir(parents=True, exist_ok=True)    # local も使うなら
+
+# ============================================================
 # UI 設定
 # ============================================================
 st.set_page_config(page_title="51 メタファイル削除", page_icon="🗑️", layout="wide")
@@ -136,12 +143,6 @@ def backup_age_days_local(backend: str, shard_id: str) -> float | None:
 
 # ============================================================
 # processed_files.json 最適化：構造保持での選択削除
-#  - 対応スキーマ：
-#      * {"done":[...]}
-#      * [...]
-#      * [{"done":[...]}, {"done":[...]}]   ← よくあるケース
-#  - 要素は str / dict（file/path/name/relpath/source/original/orig/pdf）いずれでもOK
-#  - 照合は フル/相対(shard/filename)/basename/stem + 正規化（NFKC・URLdecode・区切り統一・lower）
 # ============================================================
 def _canon(s: str) -> str:
     if not s:
@@ -264,7 +265,7 @@ st.subheader("🛡️ バックアップ（拡張）")
 
 col_a, col_b, col_c = st.columns(3)
 with col_a:
-    if st.button("⚡ 対象シャードを即時バックアップ", use_container_width=True, key="bak_one"):
+    if st.button("⚡ 対象シャードを即時バックアップ", width="stretch", key="bak_one"):
         copied, bdir = backup_all_local(base_dir, backend, shard_id)
         if copied:
             st.success(f"[{backend}/{shard_id}] をバックアップ: {bdir}")
@@ -272,7 +273,7 @@ with col_a:
             st.warning(f"[{backend}/{shard_id}] コピー対象がありません。保存先: {bdir}")
 
 with col_b:
-    if st.button("⚡ すべてのシャードを即時バックアップ", use_container_width=True, key="bak_all"):
+    if st.button("⚡ すべてのシャードを即時バックアップ", width="stretch", key="bak_all"):
         summary = []
         for sid in shard_ids:
             sdir = base_backend_dir / sid
@@ -283,7 +284,7 @@ with col_b:
 
 with col_c:
     threshold = st.selectbox("未バックアップ日数 以上ならバックアップ", [1,2,3,7,14,30], index=2, key="bak_thr")
-    if st.button("🗓 条件バックアップを実行", use_container_width=True, key="bak_cond"):
+    if st.button("🗓 条件バックアップを実行", width="stretch", key="bak_cond"):
         triggered, skipped = [], []
         for sid in shard_ids:
             age = backup_age_days_local(backend, sid)
@@ -318,7 +319,7 @@ else:
     if "file" not in df.columns:
         df["file"] = None
     st.caption(f"レコード数: {len(df):,}")
-    st.dataframe(df.head(500), use_container_width=True, height=420)
+    st.dataframe(df.head(500), width="stretch", height=420)
 
 st.divider()
 
@@ -330,7 +331,7 @@ bdirs = list_backup_dirs_local(backend, shard_id)
 if bdirs:
     sel_bdir_prev = st.selectbox("バックアッププレビュー", bdirs, format_func=lambda p: p.name, key="prev_bdir")
     if sel_bdir_prev:
-        st.dataframe(preview_backup_local(sel_bdir_prev), use_container_width=True, height=180)
+        st.dataframe(preview_backup_local(sel_bdir_prev), width="stretch", height=180)
 else:
     st.caption("まだバックアップがありません。")
 
@@ -354,8 +355,13 @@ if rows:
         )
         confirm_del = st.checkbox("削除に同意します", key="confirm_selective")
 
-    if st.button("🧹 削除実行", type="primary", use_container_width=True,
-                 disabled=not (target_files and confirm_del), key="btn_selective_delete"):
+    if st.button(
+        "🧹 削除実行",
+        type="primary",
+        width="stretch",
+        disabled=not (target_files and confirm_del),
+        key="btn_selective_delete"
+    ):
         try:
             # 直前バックアップ
             copied, bdir = backup_all_local(base_dir, backend, shard_id)
@@ -472,8 +478,13 @@ with colx:
 with coly:
     typed = st.text_input("タイプ確認：DELETE と入力", value="", key="sharddel_typed")
 
-if st.button("🗂️ シャードごと削除を実行", type="secondary", use_container_width=True,
-             disabled=not (confirm_shard_del and typed.strip().upper() == "DELETE"), key="sharddel_exec"):
+if st.button(
+    "🗂️ シャードごと削除を実行",
+    type="secondary",
+    width="stretch",
+    disabled=not (confirm_shard_del and typed.strip().upper() == "DELETE"),
+    key="sharddel_exec"
+):
     try:
         if do_backup_before_shard_delete and base_dir.exists():
             copied, bdir = backup_all_local(base_dir, backend, shard_id)
@@ -490,9 +501,6 @@ st.divider()
 
 # ============================================================
 # 🗑️ 完全初期化（3ファイルのみ削除：meta.jsonl / vectors.npy / processed_files.json）
-#    - 実行前プレビュー（存在する対象と合計サイズ）
-#    - 削除前バックアップ（既定オン）
-#    - 二重確認（チェックボックス + DELETE 入力）
 # ============================================================
 st.subheader("🗑️ 完全初期化")
 
@@ -528,7 +536,7 @@ with col_init_r:
 if st.button(
     "🗑️ 初期化実行",
     type="secondary",
-    use_container_width=True,
+    width="stretch",
     disabled=not (confirm_wipe and typed_init.strip().upper() == "DELETE"),
     key="wipe_execute"
 ):
@@ -562,9 +570,9 @@ if not bdirs:
 else:
     sel_bdir_restore = st.selectbox("復元するバックアップを選択", bdirs, format_func=lambda p: p.name, key="restore_bdir")
     if sel_bdir_restore:
-        st.dataframe(preview_backup_local(sel_bdir_restore), use_container_width=True, height=160)
+        st.dataframe(preview_backup_local(sel_bdir_restore), width="stretch", height=160)
         ok_restore = st.checkbox("復元に同意します（現在のファイルは上書きされます）", key="restore_ok")
-        if st.button("♻️ 復元実行", type="primary", use_container_width=True, disabled=not ok_restore, key="restore_exec"):
+        if st.button("♻️ 復元実行", type="primary", width="stretch", disabled=not ok_restore, key="restore_exec"):
             try:
                 restored, missing = restore_from_backup_local(base_dir, sel_bdir_restore)
                 msg = "復元完了 ✅\n" + "\n".join(f"- {x}" for x in restored)
